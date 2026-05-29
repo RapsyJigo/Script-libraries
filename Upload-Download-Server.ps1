@@ -686,3 +686,5 @@ while ($listener.IsListening) {
         try { Send-Response $ctx "<h2>500 — Internal Server Error</h2>" -status 500 } catch {}
     }
 }
+
+Start-Sleep -Seconds 5000
