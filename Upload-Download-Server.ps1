@@ -78,8 +78,8 @@ $CSS_SHARED = @'
     --bg: #0d0d0f;
     --surface: #16161a;
     --border: #2a2a32;
-    --accent: #3bf2ff;
-    --accent2: #4414f1;
+    --accent: #166eac;
+    --accent2: #00ddff;
     --text: #e8e8f0;
     --muted: #6b6b80;
     --danger: #ff5f5f;
@@ -120,7 +120,7 @@ $CSS_SHARED = @'
     height: 3px;
     background: linear-gradient(90deg, var(--accent), var(--accent2));
   }
-  h1 { font-size: 1.7rem; font-weight: 800; letter-spacing: -.02em; margin-bottom: .35rem; }
+  h1 { font-size: 3rem; font-weight: 300; letter-spacing: -.02em; margin-bottom: .35rem; }
   .sub { color: var(--muted); font-size: .9rem; margin-bottom: 2rem; font-family: var(--mono); }
   label { display: block; font-size: .8rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: .5rem; margin-top: 1.2rem; }
   input[type=password], input[type=text] {
@@ -528,15 +528,22 @@ catch {
     exit 1
 }
 
+$privateIP = (Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne "Disconnected"}).IPv4Address.IPAddress
+$publicIP = (Invoke-WebRequest ifconfig.me/ip).Content.Trim()
+
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "  ║       PowerShell File Server Running     ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Upload Page   : http://localhost:$Port/" -ForegroundColor Green
-Write-Host "  Download Page : http://localhost:$Port/download" -ForegroundColor Yellow
+Write-Host "  Upload Page   : http://${privateIP}:$Port/" -ForegroundColor Blue
+Write-Host "  Download Page : http://${privateIP}:$Port/download" -ForegroundColor Blue
 Write-Host "  Password      : $Password" -ForegroundColor Magenta
-Write-Host "  Upload Folder : $UploadFolder" -ForegroundColor Gray
+Write-Host "  Upload Folder : $UploadFolder" -ForegroundColor Blue
+Write-Host "  Local IP      : $privateIP" -ForegroundColor Blue
+Write-Host "  Public IP     : $publicIP" -ForegroundColor Blue
+Write-Host ""
+Write-Host "  To access this file server from outside LAN you must open its corresponding port number " -ForegroundColor Green
 Write-Host ""
 
 function Send-Response([System.Net.HttpListenerContext]$ctx, [string]$html, [int]$status=200, [string]$contentType="text/html; charset=utf-8", [byte[]]$rawBytes=$null) {
@@ -563,7 +570,13 @@ while ($listener.IsListening) {
     $path = $req.Url.AbsolutePath.TrimEnd('/').ToLower()
     $method = $req.HttpMethod.ToUpper()
 
-    Write-Host "  $(Get-Date -Format 'HH:mm:ss')  $method  $($req.Url.PathAndQuery)" -ForegroundColor DarkGray
+    if ($method -eq "GET") {
+      Write-Host "  $(Get-Date -Format 'HH:mm:ss') - $($req.RemoteEndPoint) - $method : $($req.Url.PathAndQuery)" -ForegroundColor DarkCyan
+    }
+    else {
+      Write-Host "  $(Get-Date -Format 'HH:mm:ss') - $($req.RemoteEndPoint) - $method : $($req.Url.PathAndQuery)" -ForegroundColor DarkRed
+    }
+
 
     try {
         # ── GET / ─────────────────────────────────────────────────────────────
