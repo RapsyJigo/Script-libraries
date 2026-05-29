@@ -149,8 +149,8 @@ $CSS_SHARED = @'
     margin-top: 1.2rem; padding: .75rem 1rem;
     border-radius: var(--radius); font-size: .88rem; font-family: var(--mono);
   }
-  .msg.ok  { background: rgba(200,241,53,.1);  color: var(--accent);  border: 1px solid rgba(200,241,53,.25); }
-  .msg.err { background: rgba(255,95,95,.1);   color: var(--danger);  border: 1px solid rgba(255,95,95,.25); }
+  .msg.ok  { background: rgba(21, 255, 33, 0.1);  color: var(--accent);  border: 1px solid rgba(21, 255, 33, 0.7); }
+  .msg.err { background: rgba(255, 35, 35, 0.1);   color: var(--danger);  border: 1px solid rgba(255, 35, 35, 0.7); }
   nav { margin-bottom: 2rem; text-align: center; }
   nav a { color: var(--muted); font-size: .85rem; text-decoration: none; font-family: var(--mono); border-bottom: 1px dashed var(--border); padding-bottom: 1px; }
   nav a:hover { color: var(--accent2); }
@@ -686,6 +686,3 @@ while ($listener.IsListening) {
         try { Send-Response $ctx "<h2>500 — Internal Server Error</h2>" -status 500 } catch {}
     }
 }
-
-$listener.Stop()
-Write-Host "Server stopped." -ForegroundColor DarkGray
