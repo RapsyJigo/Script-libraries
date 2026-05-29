@@ -572,7 +572,7 @@ while ($listener.IsListening) {
       Write-Host "  $(Get-Date -Format 'HH:mm:ss') - $($req.RemoteEndPoint) - $method : $($req.Url.PathAndQuery)" -ForegroundColor DarkCyan
     }
     else {
-      Write-Host "  $(Get-Date -Format 'HH:mm:ss') - $($req.RemoteEndPoint) - $method : $($req.Url.PathAndQuery)" -ForegroundColor DarkRed
+      Write-Host "  $(Get-Date -Format 'HH:mm:ss') - $($req.RemoteEndPoint) - $method : $($req.Url.PathAndQuery)" -ForegroundColor DarkYellow
     }
 
 
