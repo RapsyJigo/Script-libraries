@@ -24,7 +24,7 @@
 param(
     [int]    $Port         = 80,
     [string] $UploadFolder = ".\uploads",
-    [string] $Password     = "changeme"
+    [string] $Password     = ""
 )
 
 
@@ -52,6 +52,7 @@ function New-SessionToken {
 }
 
 function Test-Session([string]$token) {
+    if ([string]::IsNullOrEmpty($Password)) { return $true }  # open-access mode
     if ([string]::IsNullOrEmpty($token)) { return $false }
     $expiry = [datetime]::MinValue
     if ($Sessions.TryGetValue($token, [ref]$expiry)) {
@@ -615,7 +616,7 @@ while ($listener.IsListening) {
         # ── GET /download ─────────────────────────────────────────────────────
         elseif ($path -eq "/download") {
             $token = Get-CookieToken $req
-            if (Test-Session $token) {
+            if ([string]::IsNullOrEmpty($Password) -or (Test-Session $token)) {
                 Send-Response $ctx (Get-DownloadPage)
             } else {
                 Send-Response $ctx (Get-LoginPage)
@@ -624,18 +625,22 @@ while ($listener.IsListening) {
 
         # ── POST /download/login ──────────────────────────────────────────────
         elseif ($path -eq "/download/login" -and $method -eq "POST") {
-            $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
-            $body   = $reader.ReadToEnd()
-            $parsed = [System.Web.HttpUtility]::ParseQueryString($body)
-            $pw     = $parsed["password"]
-            if ($pw -eq $Password) {
-                $token = New-SessionToken
-                $expiry = (Get-Date).AddHours(4)
-                $Sessions[$token] = $expiry
-                $ctx.Response.AppendHeader("Set-Cookie", "ds=$token; Path=/; HttpOnly; SameSite=Strict")
+            if ([string]::IsNullOrEmpty($Password)) {
                 Send-Redirect $ctx "/download"
             } else {
-                Send-Response $ctx (Get-LoginPage -failed $true)
+                $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+                $body   = $reader.ReadToEnd()
+                $parsed = [System.Web.HttpUtility]::ParseQueryString($body)
+                $pw     = $parsed["password"]
+                if ($pw -eq $Password) {
+                    $token = New-SessionToken
+                    $expiry = (Get-Date).AddHours(4)
+                    $Sessions[$token] = $expiry
+                    $ctx.Response.AppendHeader("Set-Cookie", "ds=$token; Path=/; HttpOnly; SameSite=Strict")
+                    Send-Redirect $ctx "/download"
+                } else {
+                    Send-Response $ctx (Get-LoginPage -failed $true)
+                }
             }
         }
 
@@ -652,9 +657,10 @@ while ($listener.IsListening) {
 
         # ── GET /download/file?name=... ───────────────────────────────────────
         elseif ($path -eq "/download/file") {
-            $token = Get-CookieToken $req
+            $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
-            if (-not (Test-Session $token) -and -not($quickpass)) {
+            $authorized = [string]::IsNullOrEmpty($Password) -or (Test-Session $token) -or $quickpass
+            if (-not $authorized) {
                 Send-Redirect $ctx "/download"
             } else {
                 $name = $req.QueryString["name"]
