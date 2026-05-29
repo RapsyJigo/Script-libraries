@@ -27,6 +27,8 @@ param(
     [string] $Password     = ""
 )
 
+Write-Host "Server is starting please wait ... " -ForegroundColor White
+
 
 # ── Self-Elevation ────────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -528,7 +530,19 @@ catch {
 }
 
 $privateIP = (Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne "Disconnected"}).IPv4Address.IPAddress
-$publicIP = (Invoke-WebRequest ifconfig.me/ip).Content.Trim()
+$publicIP  = (Invoke-WebRequest ifconfig.me/ip -UseBasicParsing).Content.Trim()
+
+
+# ── Check whether port is reachable from the internet ────────────────────────
+$portOpen = $false
+try {
+    $checkUrl = "https://api.ipify.org"   # lightweight; we already have publicIP but keep this isolated
+    $probe    = Invoke-WebRequest "https://portchecker.co/check?port=$Port&ip=$publicIP" -UseBasicParsing -TimeoutSec 10
+    # portchecker returns JSON: {"status":"open"} or {"status":"closed"}
+    $portOpen = $probe.Content -match '"status"\s*:\s*"open"'
+} catch {
+    $portOpen = $false
+}
 
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Cyan
@@ -537,13 +551,25 @@ Write-Host "  ╚═════════════════════
 Write-Host ""
 Write-Host "  Upload Page   : http://${privateIP}:$Port/" -ForegroundColor Blue
 Write-Host "  Download Page : http://${privateIP}:$Port/download" -ForegroundColor Blue
-Write-Host "  Password      : $Password" -ForegroundColor Magenta
-Write-Host "  Upload Folder : $UploadFolder" -ForegroundColor Blue
-Write-Host "  Local IP      : $privateIP" -ForegroundColor Blue
-Write-Host "  Public IP     : $publicIP" -ForegroundColor Blue
+Write-Host "  Upload Folder : $UploadFolder" -ForegroundColor DarkBlue
+if ([string]::IsNullOrEmpty($Password)) {
+  Write-Host "  Password      : Unsecure mode, no password needed" -ForegroundColor Red
+}
+else {
+  Write-Host "  Password      : $Password" -ForegroundColor Magenta
+}
+Write-Host "  Local IP      : $privateIP" -ForegroundColor Black
+Write-Host "  Public IP     : $publicIP" -ForegroundColor Black
 Write-Host ""
-Write-Host "  To access this file server from outside LAN you must open its corresponding port number " -ForegroundColor Green
-Write-Host ""
+if ($upnpStatus) {
+    $upnpColor = if ($upnpStatus -like "UPnP mapping added*") { "Green" } else { "Yellow" }
+    Write-Host "  UPnP          : $upnpStatus" -ForegroundColor $upnpColor
+}
+if ($portOpen) {
+    Write-Host "  Port $Port is open — server is reachable from the internet at http://${publicIP}:$Port/" -ForegroundColor Green
+} else {
+    Write-Host "  Port $Port is closed — to reach this server from outside your LAN, forward port $Port (TCP) on your router." -ForegroundColor Yellow
+}Write-Host ""
 
 function Send-Response([System.Net.HttpListenerContext]$ctx, [string]$html, [int]$status=200, [string]$contentType="text/html; charset=utf-8", [byte[]]$rawBytes=$null) {
     $res = $ctx.Response
