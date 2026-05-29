@@ -28,7 +28,7 @@ param(
 )
 
 
-# -- Self-Elevation ----------------------------------------------------------
+# ── Self-Elevation ────────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Not running as Administrator -- relaunching elevated..." -ForegroundColor Yellow
