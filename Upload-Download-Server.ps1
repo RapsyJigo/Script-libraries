@@ -415,10 +415,10 @@ function Get-DownloadPage {
   .logout:hover { opacity: 1; }
 </style></head><body>
 <div class="card">
-  <h1>Downloads <span class="badge">Secure</span></h1>
+  <h1>Downloads $(if (-not [string]::IsNullOrEmpty($Password)) { "<span class='badge'>Secure</span></h1>" } else { "<span class='badge'>Public</span></h1>" })
   <p class="sub" style="display:flex;justify-content:space-between;align-items:center">
     <span>$($files.Count) file(s) available</span>
-    <a href='/download/logout' class='logout'>&#128274; Lock &amp; Exit</a>
+    $(if (-not [string]::IsNullOrEmpty($Password)) { "<a href='/download/logout' class='logout'>&#128274; Lock &amp; Exit</a>" })
   </p>
   <nav><a href="/">&larr; Back to Upload</a></nav>
   <table>
@@ -521,7 +521,12 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req) {
 
 # ── HTTP Server ───────────────────────────────────────────────────────────────
 $listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add("http://+:$Port/")
+$listener.Prefixes.Add("http://*:$Port/")
+
+$result = Get-NetFirewallRule -DisplayName "Powershell"
+if (-not $result) {
+  New-NetFirewallRule -DisplayName "Powershell" -Direction Inbound -Program "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -Action Allow | Out-Null
+}
 
 try { $listener.Start() }
 catch {
@@ -530,7 +535,13 @@ catch {
 }
 
 $privateIP = (Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne "Disconnected"}).IPv4Address.IPAddress
-$publicIP  = (Invoke-WebRequest ifconfig.me/ip -UseBasicParsing).Content.Trim()
+$publicIP = "No Internet"
+try {
+  $publicIP  = (Invoke-WebRequest ifconfig.me/ip -UseBasicParsing).Content.Trim()
+} catch {
+  $publicIP = "No Internet"
+}
+
 
 
 # ── Check whether port is reachable from the internet ────────────────────────
@@ -549,8 +560,10 @@ Write-Host "  ╔═════════════════════
 Write-Host "  ║       PowerShell File Server Running     ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Upload Page   : http://${privateIP}:$Port/" -ForegroundColor Blue
-Write-Host "  Download Page : http://${privateIP}:$Port/download" -ForegroundColor Blue
+foreach ($ip in $privateIP) {
+  Write-Host "  Upload Page   : http://${ip}:$Port/" -ForegroundColor Blue
+  Write-Host "  Download Page : http://${ip}:$Port/download" -ForegroundColor Blue
+}
 Write-Host "  Upload Folder : $UploadFolder" -ForegroundColor DarkBlue
 if ([string]::IsNullOrEmpty($Password)) {
   Write-Host "  Password      : Unsecure mode, no password needed" -ForegroundColor Red
