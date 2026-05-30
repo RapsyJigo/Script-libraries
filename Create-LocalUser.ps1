@@ -169,5 +169,4 @@ try {
 } catch {
     # ── Single error output ───────────────────────────────────────────────────
     Write-Error "ERROR: $_"
-    exit 1
 }
