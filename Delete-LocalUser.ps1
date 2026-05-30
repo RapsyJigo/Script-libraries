@@ -10,9 +10,6 @@
 .PARAMETER Username
     The local username to delete.
 
-.PARAMETER ProfilePath
-    (Optional) Override the profile folder path. Auto-detected via WMI by default.
-
 .EXAMPLE
     .\Remove-LocalUserAndFiles.ps1 -Username "jsmith"
 #>
@@ -20,7 +17,7 @@
 [CmdletBinding()]
 param (
     [Parameter(Mandatory = $true, HelpMessage = 'The username of the user to be deleted.')]
-    [string]$Username,
+    [string]$Username
 )
 
 Set-StrictMode -Version Latest
