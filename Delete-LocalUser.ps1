@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Silently deletes a local Windows user account and all of their profile files.
@@ -38,11 +37,13 @@ $Blacklist = @(
     'NETWORK SERVICE'
 )
 
-# ── 1. Verify running as Administrator ───────────────────────────────────────
+# ── 1. Self-elevate if not running as Administrator ──────────────────────────
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Error "Script must run as Administrator."
-    exit 1
+    $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Username `"$Username`""
+    if ($ProfilePath) { $argList += " -ProfilePath `"$ProfilePath`"" }
+    Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -Wait
+    exit $LASTEXITCODE
 }
 
 # ── 2. Blacklist check ───────────────────────────────────────────────────────

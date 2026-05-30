@@ -30,3 +30,12 @@ Downloads a file from the internet and saves it at the specified location.
 ```powershell
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Block-Internet-Except-IPs.ps1').Content)) -Url "https://example.com/report.pdf" -Destination "C:\Downloads"
 ```
+
+## Remove localuser
+
+Deletes a local user and all it's files from the computer
+
+```powershell
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Delete-LocalUser.ps1').Content)) -Username "test"
+
+```
