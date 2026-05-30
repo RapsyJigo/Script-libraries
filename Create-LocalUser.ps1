@@ -96,7 +96,7 @@ try {
             $taskName      = "CreateProfile_$Username"
             $taskAction    = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c exit"
             $taskSettings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -DeleteExpiredTaskAfter (New-TimeSpan -Seconds 1)
-            $taskPrincipal = New-ScheduledTaskPrincipal -UserId $Username -LogonType Interactive
+            $taskPrincipal = New-ScheduledTaskPrincipal -UserId $userSID -LogonType Interactive
 
             Register-ScheduledTask -TaskName $taskName `
                 -Action    $taskAction `
