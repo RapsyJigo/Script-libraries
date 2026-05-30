@@ -16,7 +16,7 @@ Script for blocking internet access except specified IPs, uses simple windows fi
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Block-Internet-Except-IPs.ps1').Content)) -AllowedIPs '0.0.0.0'
 ```
 
-These scripts are nto self elevating so make sure to run them as admin
+These scripts are not self elevating so make sure to run them as admin
 
 ```powershell
 .\Block-Internet-Except-IPs.ps1 -AllowedIPs '0.0.0.0, 1.1.1.1'
