@@ -551,10 +551,9 @@ try {
 # ── Check whether port is reachable from the internet ────────────────────────
 $portOpen = $false
 try {
-    $checkUrl = "https://api.ipify.org"   # lightweight; we already have publicIP but keep this isolated
-    $probe    = Invoke-WebRequest "https://portchecker.co/check?port=$Port&ip=$publicIP" -UseBasicParsing -TimeoutSec 10
+    $probe    = Invoke-WebRequest "https://portchecker.io/api/me/${port}" -UseBasicParsing -TimeoutSec 10
     # portchecker returns JSON: {"status":"open"} or {"status":"closed"}
-    $portOpen = $probe.Content -match '"status"\s*:\s*"open"'
+    $portOpen = $probe.Content -match 'True'
 } catch {
     $portOpen = $false
 }
