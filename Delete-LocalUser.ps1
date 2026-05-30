@@ -20,11 +20,8 @@
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, HelpMessage = 'The username of the user to be deleted.')]
     [string]$Username,
-
-    [Parameter(Mandatory = $false)]
-    [string]$ProfilePath
 )
 
 Set-StrictMode -Version Latest
@@ -92,16 +89,14 @@ try {
 }
 
 # ── 5. Resolve the profile directory path ────────────────────────────────────
-if (-not $ProfilePath) {
-    $wmiProfile = Get-CimInstance -ClassName Win32_UserProfile |
-        Where-Object { $_.SID -eq $localUser.SID.Value }
+$wmiProfile = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq $localUser.SID.Value }
 
-    $ProfilePath = if ($wmiProfile) {
-        $wmiProfile.LocalPath
-    } else {
-        Join-Path $env:SystemDrive "Users\$Username"
-    }
+$ProfilePath = if ($wmiProfile) {
+    $wmiProfile.LocalPath
+} else {
+    Join-Path $env:SystemDrive "Users\$Username"
 }
+
 
 $profileExists = Test-Path $ProfilePath
 
