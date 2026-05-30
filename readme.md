@@ -1,6 +1,6 @@
 # **A collection of more advanced scripts for incredibly specific things**
 
-##### File server
+## File server
 
 Script for creating an upload server where uploading isn't password protected but downloading is, useful for collecting exam files.
 
@@ -8,7 +8,7 @@ Script for creating an upload server where uploading isn't password protected bu
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Upload-Download-Server.ps1').Content)) -Port 80 -UploadFolder '.\uploads' -Password ''
 ```
 
-##### Internet control
+## Internet control
 
 Script for blocking internet access except specified IPs, uses simple windows firewall rules so admin users can trivially bypass it. **Make sure to download the unblock script before blocking the internet access otherwise you're stuck. Highly recommend downloading both files before locking / unlocking internet**
 
@@ -23,7 +23,7 @@ These scripts are nto self elevating so make sure to run them as admin
 .\Unblock-Internet.ps1
 ```
 
-##### Download file from web
+## Download file from web
 
 Downloads a file from the internet and saves it at the specified location
 
