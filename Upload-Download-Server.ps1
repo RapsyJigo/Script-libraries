@@ -34,8 +34,9 @@ Write-Host "Server is starting please wait ... " -ForegroundColor White
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Not running as Administrator -- relaunching elevated..." -ForegroundColor Yellow
+    $folder = Resolve-Path -Path $UploadFolder
     $url     = 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Upload-Download-Server.ps1'
-    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$UploadFolder' -Password '$Password'`""
+    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$folder' -Password '$Password'`""
     Start-Process powershell -Verb RunAs -ArgumentList $argList
     exit
 }
