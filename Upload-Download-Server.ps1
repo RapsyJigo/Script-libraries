@@ -29,6 +29,7 @@ param(
     [string] $UploadFolder = ".\uploads",
 
     [Parameter(Mandatory = $true, HelpMessage = "The password to be used to access the download page. If the password is left as a blank string the server will run in unsecure mode.")]
+    [AllowEmptyString()]
     [string] $Password     = ""
 )
 
