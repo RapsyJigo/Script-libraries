@@ -571,8 +571,8 @@ if ([string]::IsNullOrEmpty($Password)) {
 else {
   Write-Host "  Password      : $Password" -ForegroundColor Magenta
 }
-Write-Host "  Local IP      : $privateIP" -ForegroundColor Black
-Write-Host "  Public IP     : $publicIP" -ForegroundColor Black
+Write-Host "  Local IP      : $privateIP" -ForegroundColor DarkGray
+Write-Host "  Public IP     : $publicIP" -ForegroundColor DarkGray
 Write-Host ""
 if ($upnpStatus) {
     $upnpColor = if ($upnpStatus -like "UPnP mapping added*") { "Green" } else { "Yellow" }
