@@ -63,27 +63,19 @@ if ($localUser.SID.Value -match '-(500|501)$') {
     exit 1
 }
 
-# ── 4. Force log off all active sessions for this user ───────────────────────
+# ── 4. Force log off ALL active user sessions ────────────────────────────────
 try {
     $sessions = query session 2>$null |
-        Select-String -Pattern "^\s*>?\s*$([regex]::Escape($Username))\s" |
+        Select-String -Pattern "^\s*>?\s*\S+\s+\S+\s+(\d+)\s+(Active|Disc)" |
         ForEach-Object { ($_ -split '\s+' | Where-Object { $_ -ne '' })[2] }
-
+ 
     foreach ($sid in $sessions) {
         if ($sid -match '^\d+$') {
             logoff $sid 2>$null | Out-Null
         }
     }
-
-    $userProcs = Get-CimInstance -ClassName Win32_Process |
-        Where-Object {
-            try { ($_.GetOwner()).User -eq $Username } catch { $false }
-        }
-    foreach ($proc in $userProcs) {
-        try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-    }
 } catch {
-    Write-Warning "Session/process cleanup for '$Username' had an issue: $_"
+    Write-Warning "Session logoff had an issue: $_"
 }
 
 # ── 5. Resolve the profile directory path ────────────────────────────────────
