@@ -33,9 +33,16 @@ Downloads a file from the internet and saves it at the specified location.
 
 ## Remove localuser
 
-Deletes a local user and all it's files from the computer
+Deletes a local user and all it's files from the computer.
 
 ```powershell
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Delete-LocalUser.ps1').Content)) -Username "test"
+```
 
+## Create localuser
+
+Creates a new local user and skips all the first logon user ads and prompts from windows, to create a non-password user leave the password string blank.
+
+```powershell
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Create-LocalUser.ps1').Content)) -Username "test" -Password "" -Group "Users"
 ```

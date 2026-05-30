@@ -168,6 +168,6 @@ try {
 
 } catch {
     # ── Single error output ───────────────────────────────────────────────────
-    Write-Output "ERROR: $_"
+    Write-Error "ERROR: $_"
     exit 1
 }
