@@ -27,10 +27,10 @@ param(
     [string] $Password     = ""
 )
 
+# ── Setup ────────────────────────────────────────────────────────────────────
+$ErrorActionPreference = "Stop"
 Write-Host "Server is starting please wait ... " -ForegroundColor White
-$UploadFolder = Resolve-Path -Path $UploadFolder -ErrorAction Stop
-Write-Host $UploadFolder
-Start-Sleep -Seconds 5000
+$UploadFolder = (New-Item -ItemType Directory -Force -Path $UploadFolder).FullName
 
 # ── Self-Elevation ────────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -41,10 +41,6 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Start-Process powershell -Verb RunAs -ArgumentList $argList
     exit
 }
-
-# ── Setup ────────────────────────────────────────────────────────────────────
-$ErrorActionPreference = "Stop"
-$UploadFolder = (New-Item -ItemType Directory -Force -Path $UploadFolder).FullName
 
 # Simple in-memory session store  { token -> expiry }
 $Sessions = [System.Collections.Concurrent.ConcurrentDictionary[string,datetime]]::new()
