@@ -11,20 +11,22 @@
     No backup file is needed. Run Restore-Firewall.ps1 to undo.
 
 .PARAMETER AllowedIPs
-    One or more IP addresses or CIDR ranges to allow.
+    Comma-separated string of IP addresses or CIDR ranges to allow.
 
 .EXAMPLE
-    .\Set-IPAllowlist.ps1 -AllowedIPs "8.8.8.8","1.1.1.1","192.168.1.0/24"
+    .\Set-IPAllowlist.ps1 -AllowedIPs "8.8.8.8,1.1.1.1,192.168.1.0/24"
 #>
 
 param (
     [Parameter(Mandatory = $true)]
-    [string[]]$AllowedIPs
+    [string]$AllowedIPs
 )
 
 $RulePrefix = "IPAllowlist_"
 
-if ($AllowedIPs.Count -eq 0) {
+$IPList = $AllowedIPs -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+
+if ($IPList.Count -eq 0) {
     Write-Error "You must supply at least one IP address."
     exit 1
 }
@@ -51,8 +53,8 @@ New-NetFirewallRule -Name "${RulePrefix}Allow_Loopback_In" `
     -RemoteAddress "127.0.0.0/8" -Profile Any -Enabled True | Out-Null
 
 # ── Add allow rules for each supplied IP ─────────────────────────────────────
-Write-Host "[*] Creating allow rules for $($AllowedIPs.Count) IP(s) ..." -ForegroundColor Cyan
-foreach ($ip in $AllowedIPs) {
+Write-Host "[*] Creating allow rules for $($IPList.Count) IP(s) ..." -ForegroundColor Cyan
+foreach ($ip in $IPList) {
     $ip      = $ip.Trim()
     $safe    = $ip -replace '[/\\:\*\?"<>\|]', '_'
     Write-Host "    + $ip" -ForegroundColor Yellow
@@ -76,6 +78,6 @@ Set-NetFirewallProfile -All -Enabled True -DefaultOutboundAction Block -DefaultI
 
 Write-Host ""
 Write-Host "Done. Internet is now restricted to:" -ForegroundColor Green
-$AllowedIPs | ForEach-Object { Write-Host "    - $_" -ForegroundColor White }
+$IPList | ForEach-Object { Write-Host "    - $_" -ForegroundColor White }
 Write-Host ""
 Write-Host "Run Restore-Firewall.ps1 to re-open internet access." -ForegroundColor Cyan
