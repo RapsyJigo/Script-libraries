@@ -22,8 +22,13 @@
     .\FileServer.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
 #>
 param(
+    [Parameter(Mandatory = $false, HelpMessage = "The port on which the server will be opened. Must have no other processes using this port.")]
     [int]    $Port         = 80,
+
+    [Parameter(Mandatory = $false, HelpMessage = "The folder where all the files will be saved to, you can put your own files there if you only wish to use the download part of the server without going through uploading")]
     [string] $UploadFolder = ".\uploads",
+
+    [Parameter(Mandatory = $true, HelpMessage = "The password to be used to access the download page. If the password is left as a blank string the server will run in unsecure mode.")]
     [string] $Password     = ""
 )
 

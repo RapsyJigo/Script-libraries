@@ -26,7 +26,7 @@ try {
     $fileName = [System.IO.Path]::GetFileName($uri.LocalPath)
  
     if ([string]::IsNullOrWhiteSpace($fileName)) {
-        Write-Error "Could not determine a filename from the URL: '$Url'"
+        Write-Error "Could not determine a filename from the URL: '$Url'."
         exit 1
     }
 } catch {
@@ -54,7 +54,7 @@ try {
 # ── Verify ───────────────────────────────────────────────────────────────────
 if (Test-Path -Path $outputPath) {
     $size = (Get-Item $outputPath).Length
-    Write-Host "Done! '$fileName' saved ($size bytes)." -ForegroundColor Green
+    Write-Host "Done! '$fileName' saved ($size bytes) at '$Destination'." -ForegroundColor Green
 } else {
     Write-Error "File was not saved. Something went wrong."
     exit 1
