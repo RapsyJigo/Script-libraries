@@ -31,14 +31,14 @@ if ($IPList.Count -eq 0) {
     exit 1
 }
 
-# ── Clean up any stale rules from a previous run ──────────────────────────────
+# ── Clean up any stale rules from a previous run ─────────────────────────────
 $stale = Get-NetFirewallRule -DisplayName "${RulePrefix}*" -ErrorAction SilentlyContinue
 if ($stale) {
     Write-Host "[*] Removing stale IPAllowlist rules from a previous run ..." -ForegroundColor Cyan
     $stale | Remove-NetFirewallRule
 }
 
-# ── Allow loopback so local services keep working ─────────────────────────────
+# ── Allow loopback so local services keep working ────────────────────────────
 Write-Host "[*] Adding loopback allow rules ..." -ForegroundColor Cyan
 New-NetFirewallRule -Name "${RulePrefix}Allow_Loopback_Out" `
     -DisplayName "${RulePrefix}Allow_Loopback_Out" `
@@ -72,7 +72,7 @@ foreach ($ip in $IPList) {
         -RemoteAddress $ip -Profile Any -Enabled True | Out-Null
 }
 
-# ── Block everything else by changing global defaults ─────────────────────────
+# ── Block everything else by changing global defaults ────────────────────────
 Write-Host "[*] Setting default outbound/inbound action to BLOCK on all profiles ..." -ForegroundColor Cyan
 Set-NetFirewallProfile -All -Enabled True -DefaultOutboundAction Block -DefaultInboundAction Block
 

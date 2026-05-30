@@ -15,7 +15,7 @@
 
 $RulePrefix = "IPAllowlist_"
 
-# ── FIRST: reset global defaults so internet is unblocked immediately ─────────
+# ── FIRST: reset global defaults so internet is unblocked immediately ────────
 # Do this before anything else so a mid-script error can't leave the machine locked.
 Write-Host "[*] Resetting firewall profile defaults to Allow ..." -ForegroundColor Cyan
 Set-NetFirewallProfile -All `
@@ -23,7 +23,7 @@ Set-NetFirewallProfile -All `
     -DefaultInboundAction  Block    # Block unsolicited inbound — the normal Windows default
 Write-Host "    Outbound traffic is now allowed." -ForegroundColor Green
 
-# ── Remove all IPAllowlist_ rules ─────────────────────────────────────────────
+# ── Remove all IPAllowlist_ rules ────────────────────────────────────────────
 Write-Host "[*] Removing all '${RulePrefix}*' firewall rules ..." -ForegroundColor Cyan
 $rules = Get-NetFirewallRule -DisplayName "${RulePrefix}*" -ErrorAction SilentlyContinue
 if ($rules) {

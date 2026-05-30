@@ -14,7 +14,6 @@ Script for blocking internet access except specified IPs, uses simple windows fi
 
 ```powershell
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Block-Internet-Except-IPs.ps1').Content)) -AllowedIPs '0.0.0.0'
-
 ```
 
 These scripts are nto self elevating so make sure to run them as admin
@@ -22,4 +21,12 @@ These scripts are nto self elevating so make sure to run them as admin
 ```powershell
 .\Block-Internet-Except-IPs.ps1 -AllowedIPs '0.0.0.0, 1.1.1.1'
 .\Unblock-Internet.ps1
+```
+
+##### Download file from web
+
+Downloads a file from the internet and saves it at the specified location
+
+```powershell
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Block-Internet-Except-IPs.ps1').Content)) -Url "https://example.com/report.pdf" -Destination "C:\Downloads"
 ```

@@ -32,7 +32,7 @@ $ErrorActionPreference = "Stop"
 Write-Host "Server is starting please wait ... " -ForegroundColor White
 $UploadFolder = (New-Item -ItemType Directory -Force -Path $UploadFolder).FullName
 
-# ── Self-Elevation ────────────────────────────────────────────────────────────
+# ── Self-Elevation ───────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Not running as Administrator -- relaunching elevated..." -ForegroundColor Yellow
@@ -68,7 +68,7 @@ function Get-CookieToken([System.Net.HttpListenerRequest]$req) {
     return ""
 }
 
-# ── HTML Templates ────────────────────────────────────────────────────────────
+# ── HTML Templates ───────────────────────────────────────────────────────────
 
 $CSS_SHARED = @'
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap');
@@ -161,7 +161,7 @@ $CSS_SHARED = @'
   }
 '@
 
-# -- Upload Page -------------------------------------------------------------
+# ── Upload Page ──────────────────────────────────────────────────────────────
 function Get-UploadPage([string]$msg = "", [bool]$isError = $false) {
     $msgHtml = ""
     if ($msg) {
@@ -359,7 +359,7 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
 "@
 }
 
-# ── Login Page ────────────────────────────────────────────────────────────────
+# ── Login Page ───────────────────────────────────────────────────────────────
 function Get-LoginPage([bool]$failed = $false) {
     $errHtml = if ($failed) { "<div class='msg err'>&#10007;&nbsp; Incorrect password. Try again.</div>" } else { "" }
     return @"
@@ -382,7 +382,7 @@ function Get-LoginPage([bool]$failed = $false) {
 "@
 }
 
-# ── Download Page ─────────────────────────────────────────────────────────────
+# ── Download Page ────────────────────────────────────────────────────────────
 function Get-DownloadPage {
     $files = Get-ChildItem -Path $UploadFolder -File | Sort-Object LastWriteTime -Descending
     $rows = if ($files.Count -eq 0) {
@@ -428,7 +428,7 @@ function Get-DownloadPage {
 "@
 }
 
-# ── Multipart Parser ──────────────────────────────────────────────────────────
+# ── Multipart Parser ─────────────────────────────────────────────────────────
 function Save-UploadedFile([System.Net.HttpListenerRequest]$req) {
     $contentType = $req.ContentType
     if (-not $contentType -or $contentType -notmatch "multipart/form-data") { return $null }
@@ -517,7 +517,7 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req) {
     return $savedNames
 }
 
-# ── HTTP Server ───────────────────────────────────────────────────────────────
+# ── HTTP Server ──────────────────────────────────────────────────────────────
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://*:$Port/")
 
@@ -615,7 +615,7 @@ while ($listener.IsListening) {
 
 
     try {
-        # ── GET / ─────────────────────────────────────────────────────────────
+        # ── GET / ────────────────────────────────────────────────────────────
         if ($path -eq "" -or $path -eq "/") {
             $ok = $req.QueryString["ok"]
             $err = $req.QueryString["err"]
@@ -624,7 +624,7 @@ while ($listener.IsListening) {
             Send-Response $ctx (Get-UploadPage -msg $msg -isError $isErr)
         }
 
-        # ── POST /upload ──────────────────────────────────────────────────────
+        # ── POST /upload ─────────────────────────────────────────────────────
         elseif ($path -eq "/upload" -and $method -eq "POST") {
             $names = Save-UploadedFile $req
             if ($names -and $names.Count -gt 0) {
@@ -635,7 +635,7 @@ while ($listener.IsListening) {
             }
         }
 
-        # ── POST /upload-chunk (single file per XHR, used by progress uploader) ─────
+        # ── POST /upload-chunk (single file per XHR, used by progress uploader)
         elseif ($path -eq "/upload-chunk" -and $method -eq "POST") {
             $names = Save-UploadedFile $req
             if ($names -and $names.Count -gt 0) {
@@ -650,7 +650,7 @@ while ($listener.IsListening) {
             }
         }
 
-        # ── GET /download ─────────────────────────────────────────────────────
+        # ── GET /download ────────────────────────────────────────────────────
         elseif ($path -eq "/download") {
             $token = Get-CookieToken $req
             if ([string]::IsNullOrEmpty($Password) -or (Test-Session $token)) {
@@ -660,7 +660,7 @@ while ($listener.IsListening) {
             }
         }
 
-        # ── POST /download/login ──────────────────────────────────────────────
+        # ── POST /download/login ─────────────────────────────────────────────
         elseif ($path -eq "/download/login" -and $method -eq "POST") {
             if ([string]::IsNullOrEmpty($Password)) {
                 Send-Redirect $ctx "/download"
@@ -681,7 +681,7 @@ while ($listener.IsListening) {
             }
         }
 
-        # ── GET /download/logout ──────────────────────────────────────────────
+        # ── GET /download/logout ─────────────────────────────────────────────
         elseif ($path -eq "/download/logout") {
             $token = Get-CookieToken $req
             if ($token) {
@@ -692,7 +692,7 @@ while ($listener.IsListening) {
             Send-Redirect $ctx "/download"
         }
 
-        # ── GET /download/file?name=... ───────────────────────────────────────
+        # ── GET /download/file?name=... ──────────────────────────────────────
         elseif ($path -eq "/download/file") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -717,7 +717,7 @@ while ($listener.IsListening) {
             }
         }
 
-        # ── 404 ───────────────────────────────────────────────────────────────
+        # ── 404 ──────────────────────────────────────────────────────────────
         else {
             Send-Response $ctx "<h2 style='font-family:sans-serif;color:#888'>404 — Not Found</h2>" -status 404
         }
