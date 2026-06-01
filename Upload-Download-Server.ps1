@@ -692,7 +692,6 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         return -1
     }
 
-    [byte[]]$dash2     = 45,45                        # "--"
     [byte[]]$boundB    = [System.Text.Encoding]::ASCII.GetBytes($boundary)
     [byte[]]$delimB    = [System.Text.Encoding]::ASCII.GetBytes("`r`n--$boundary")
     [byte[]]$dblCRLF   = 13,10,13,10
@@ -821,6 +820,8 @@ if ($portOpen) {
 } else {
     Write-Host "  Port $Port is closed — to reach this server from outside your LAN, forward port $Port (TCP) on your router." -ForegroundColor Yellow
 }Write-Host ""
+
+Start-Process "http://${ip}:${Port}/"
 
 function Send-Response([System.Net.HttpListenerContext]$ctx, [string]$html, [int]$status=200, [string]$contentType="text/html; charset=utf-8", [byte[]]$rawBytes=$null) {
     $res = $ctx.Response
