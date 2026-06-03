@@ -39,7 +39,7 @@ param(
 
     [Parameter(Mandatory = $true, HelpMessage = "The password to be used to access the download page. If the password is left as a blank string the server will run in unsecure mode.")]
     [AllowEmptyString()]
-    [string] $Password     = "",
+    [string] $Password,
 
     [Parameter(Mandatory = $false, HelpMessage = "Regex pattern upload filenames must match. Empty = no restriction.")]
     [AllowEmptyString()]
@@ -105,7 +105,7 @@ $script:UploadableFilesCache = @{
 
 $script:AllSendersZipCache = @{
     Hash        = $null
-    Bytes       = $null
+    ZipPath     = $null
     DisplayName = "all-senders.zip"
     BuiltAt     = $null
 }
@@ -202,7 +202,7 @@ function Clear-UploadableFilesCache {
     $script:UploadableFilesCache.Stamp = $null
     $script:UploadableFilesCache.Files = $null
     $script:AllSendersZipCache.Hash = $null
-    $script:AllSendersZipCache.Bytes = $null
+    $script:AllSendersZipCache.ZipPath = $null
     $script:AllSendersZipCache.BuiltAt = $null
 }
 
@@ -401,33 +401,61 @@ function Get-OrBuildSenderZip([string]$senderIp, $zipFiles) {
     return $paths
 }
 
-function Get-AllSendersZipBytes($files) {
+function Get-AllSendersZipCachePaths {
+    $cacheDir = Get-ZipCacheDir
+    @{
+        ZipPath      = Join-Path $cacheDir "all-senders.zip"
+        ManifestPath = Join-Path $cacheDir "all-senders.manifest.json"
+        DisplayName  = "all-senders.zip"
+    }
+}
+
+function Get-OrBuildAllSendersZip($files) {
     $fingerprint = Get-AllSendersZipFingerprint $files
     $hash = Get-ZipFingerprintHash $fingerprint
+    $paths = Get-AllSendersZipCachePaths
 
     [System.Threading.Monitor]::Enter($script:AllSendersZipLock)
     try {
-        if ($script:AllSendersZipCache.Hash -eq $hash -and $null -ne $script:AllSendersZipCache.Bytes) {
-            Write-ServerLog "All-senders zip cache hit ($($script:AllSendersZipCache.Bytes.Length) bytes)" -Level Debug
+        if ($script:AllSendersZipCache.Hash -eq $hash -and
+            $null -ne $script:AllSendersZipCache.ZipPath -and
+            (Test-Path -LiteralPath $script:AllSendersZipCache.ZipPath)) {
+            $cachedSize = (Get-Item -LiteralPath $script:AllSendersZipCache.ZipPath).Length
+            Write-ServerLog "All-senders zip cache hit ($cachedSize bytes) -> $($script:AllSendersZipCache.ZipPath)" -Level Debug
             return @{
-                Bytes       = $script:AllSendersZipCache.Bytes
+                ZipPath     = $script:AllSendersZipCache.ZipPath
                 DisplayName = $script:AllSendersZipCache.DisplayName
             }
         }
 
-        Write-ServerLog "All-senders zip cache miss — building mega zip" -Level Info
-        $grouped = $files | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name
-        $ms = New-Object System.IO.MemoryStream
+        if (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint) {
+            $diskSize = (Get-Item -LiteralPath $paths.ZipPath).Length
+            Write-ServerLog "All-senders zip disk cache hit ($diskSize bytes) -> $($paths.ZipPath)" -Level Debug
+            $script:AllSendersZipCache.Hash    = $hash
+            $script:AllSendersZipCache.ZipPath = $paths.ZipPath
+            $script:AllSendersZipCache.BuiltAt = Get-Date
+            return @{
+                ZipPath     = $paths.ZipPath
+                DisplayName = $paths.DisplayName
+            }
+        }
+
+        Write-ServerLog "All-senders zip cache miss — building mega zip on disk" -Level Info
+        $grouped  = $files | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name
+        $partPath = "$($paths.ZipPath).part"
+        if (Test-Path -LiteralPath $partPath) { Remove-Item -LiteralPath $partPath -Force }
+
+        $fs = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew)
         try {
-            $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+            $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
             try {
                 $usedNames = @{}
                 foreach ($group in $grouped) {
-                    $senderIp = [string]$group.Name
+                    $senderIp  = [string]$group.Name
                     $senderZip = Get-OrBuildSenderZip $senderIp @($group.Group)
                     $entryName = $senderZip.DisplayName
-                    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($entryName)
-                    $ext = [System.IO.Path]::GetExtension($entryName)
+                    $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($entryName)
+                    $ext       = [System.IO.Path]::GetExtension($entryName)
                     if ([string]::IsNullOrEmpty($ext)) { $ext = ".zip" }
                     $n = 1
                     while ($usedNames.ContainsKey($entryName.ToLowerInvariant())) {
@@ -436,7 +464,7 @@ function Get-AllSendersZipBytes($files) {
                     }
                     $usedNames[$entryName.ToLowerInvariant()] = $true
 
-                    $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::NoCompression)
+                    $entry       = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::NoCompression)
                     $entryStream = $entry.Open()
                     try {
                         $src = [System.IO.File]::OpenRead($senderZip.ZipPath)
@@ -444,19 +472,21 @@ function Get-AllSendersZipBytes($files) {
                     } finally { $entryStream.Dispose() }
                 }
             } finally { $zip.Dispose() }
+        } finally { $fs.Dispose() }
 
-            $bytes = $ms.ToArray()
-            $script:AllSendersZipCache.Hash = $hash
-            $script:AllSendersZipCache.Bytes = $bytes
-            $script:AllSendersZipCache.DisplayName = "all-senders.zip"
-            $script:AllSendersZipCache.BuiltAt = Get-Date
-            Write-ServerLog "All-senders zip built in memory ($($bytes.Length) bytes)" -Level Ok
-            return @{
-                Bytes       = $bytes
-                DisplayName = $script:AllSendersZipCache.DisplayName
-            }
-        } finally {
-            $ms.Dispose()
+        if (Test-Path -LiteralPath $paths.ZipPath) { Remove-Item -LiteralPath $paths.ZipPath -Force }
+        Move-Item -LiteralPath $partPath -Destination $paths.ZipPath -Force
+        Save-ZipCacheManifest $paths.ManifestPath $fingerprint
+
+        $zipSize = (Get-Item -LiteralPath $paths.ZipPath).Length
+        Write-ServerLog "All-senders zip built on disk ($zipSize bytes) -> $($paths.ZipPath)" -Level Ok
+
+        $script:AllSendersZipCache.Hash    = $hash
+        $script:AllSendersZipCache.ZipPath = $paths.ZipPath
+        $script:AllSendersZipCache.BuiltAt = Get-Date
+        return @{
+            ZipPath     = $paths.ZipPath
+            DisplayName = $paths.DisplayName
         }
     } finally {
         [System.Threading.Monitor]::Exit($script:AllSendersZipLock)
@@ -1262,9 +1292,9 @@ function Get-DownloadPage {
                 $dispName = [System.Net.WebUtility]::HtmlEncode((Get-DisplayName $_.Name))
                 $rawName  = [System.Net.WebUtility]::HtmlEncode($_.Name)
                 $enc      = [Uri]::EscapeDataString($_.Name)
-                $size     = if ($_.Length -lt 1024) { "$($_.Length) B" } elseif ($_.Length -lt 1MB) { "{0:N1} KB" -f ($_.Length/1KB) } else { "{0:N1} MB" -f ($_.Length/1MB) }
+                $size     = if ($_.Length -lt 1024) { "$($_.Length) B" } elseif ($_.Length -lt 1048576) { "{0:N1} KB" -f ($_.Length/1KB) } elseif ($_.Length -lt 1073741824) { "{0:N1} MB" -f ($_.Length/1MB) } else { "{0:N1} GB" -f ($_.Length/1GB) }
                 $date     = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
-                "<tr><td><a href='/download/file?name=$enc' class='dl-link dl-href' title='$rawName'>&#128196;&nbsp;$dispName</a></td><td>$size</td><td>$date</td><td><button class='copy-url-btn' data-name='$enc' onclick=`"copyUrl(this)`" title='Copy direct download link'>&#128279; Copy URL</button></td></tr>"
+                "<tr><td><a href='/download/file?name=$enc' class='dl-link dl-href' title='$rawName'>&#128196;&nbsp;$dispName</a></td><td>$size</td><td>$date</td><td><button class='copy-url-btn' data-name='$enc' onclick=`"copyUrl(this)`" title='Copy direct download link'>&#128279;<span class='url-label'> Copy URL</span></button></td></tr>"
             }) -join "`n"
 
             @"
@@ -1276,11 +1306,12 @@ function Get-DownloadPage {
       <span class="ip-count badge">$count file$(if($count -ne 1){'s'})</span>
       <span class="ip-chevron" id="chev-$groupId">&#9650;</span>
     </button>
-    <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files from this sender"><span class="wide-label">&#11123; Download All</span><span class="short-label">&#11123; All</span></button>
-    <button class="zip-all-btn" onclick="zipAll(this)" data-ip="$ip" title="Zip and download all files from this sender"><span class="wide-label">&#128230; Zip &amp; Download</span><span class="short-label">&#128230; All</span></button>
+    <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files from this sender">&#9196; Download All</button>
+    <button class="zip-all-btn" onclick="zipAll(this)" data-ip="$ip" title="Zip and download all files from this sender">&#128230; Zip &amp; Download</button>
   </div>
   <div class="ip-body" id="$groupId" data-files="[$encListJson]">
     <table>
+      <colgroup><col class="col-file"><col class="col-size"><col class="col-date"><col class="col-action"></colgroup>
       <thead><tr><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
       <tbody>$rowsHtml</tbody>
     </table>
@@ -1296,9 +1327,7 @@ function Get-DownloadPage {
 <title>Download Files</title>
 <style>$CSS_SHARED
   /* ── Download-specific ── */
-  .dl-content {
-    max-width: 1200px; margin: 0 auto;
-  }
+  .dl-content { max-width: 1200px; margin: 0 auto; }
   .stat-pill {
     display: inline-flex; align-items: center; gap: .3rem;
     border-radius: 999px; padding: .25rem .75rem;
@@ -1306,6 +1335,8 @@ function Get-DownloadPage {
     border: 1px solid var(--border); background: rgba(255,255,255,.04);
   }
   .stat-pill strong { color: var(--text); }
+
+  /* ── Group card ── */
   .ip-group {
     margin-bottom: 1rem; border: 1px solid var(--border);
     border-radius: var(--radius); overflow: hidden;
@@ -1325,23 +1356,48 @@ function Get-DownloadPage {
     min-width: 0;
   }
   .ip-header:hover { background: rgba(255,255,255,.05); }
-  .ip-icon { font-size: 1rem; }
-  .ip-addr { flex: 1; font-family: var(--mono); color: var(--accent2); font-size: .88rem; }
-  .ip-chevron { font-size: .65rem; color: var(--muted); transition: transform .2s; }
+  .ip-icon { font-size: 1rem; flex-shrink: 0; }
+  .ip-addr { flex: 1; font-family: var(--mono); color: var(--accent2); font-size: .88rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ip-chevron { font-size: .65rem; color: var(--muted); transition: transform .2s; flex-shrink: 0; }
   .ip-chevron.collapsed { transform: rotate(180deg); }
   .ip-body.collapsed { display: none; }
-  table { width: 100%; border-collapse: collapse; }
+
+  /* ── Table ── */
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  col.col-file   { width: auto; }
+  col.col-size   { width: 6rem; }
+  col.col-date   { width: 9.5rem; }
+  col.col-action { width: 8.5rem; }
   th {
     text-align: left; font-size: .72rem; letter-spacing: .08em; text-transform: uppercase;
     color: var(--muted); padding: .55rem 1.2rem; border-bottom: 1px solid var(--border);
-    background: rgba(0,0,0,.2);
+    background: rgba(0,0,0,.2); overflow: hidden;
   }
-  td { padding: .7rem 1.2rem; border-bottom: 1px solid rgba(255,255,255,.04); font-size: .9rem; vertical-align: middle; }
-  td:nth-child(2), td:nth-child(3) { color: var(--muted); font-family: var(--mono); font-size: .8rem; white-space: nowrap; }
+  td {
+    padding: .7rem 1.2rem; border-bottom: 1px solid rgba(255,255,255,.04);
+    font-size: .9rem; vertical-align: middle; overflow: hidden;
+  }
+  /* filename cell: clamp to 3 lines then ellipsis */
+  td:nth-child(1) {
+    overflow: hidden;
+  }
+  .dl-link {
+    color: var(--accent2); text-decoration: none; font-family: var(--mono); font-size: .85rem;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; word-break: break-all;
+  }
+  .dl-link:hover { color: var(--accent); }
+  /* size + date columns */
+  td:nth-child(2), td:nth-child(3) {
+    color: var(--muted); font-family: var(--mono); font-size: .8rem; white-space: nowrap;
+  }
+  /* action column */
+  td:nth-child(4) { white-space: nowrap; padding-right: 1rem; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: rgba(255,255,255,.02); }
-  .dl-link { color: var(--accent2); text-decoration: none; font-family: var(--mono); font-size: .85rem; }
-  .dl-link:hover { color: var(--accent); }
+
+  /* ── Buttons ── */
   .copy-url-btn {
     display: inline-flex; align-items: center; gap: .35rem;
     padding: .3rem .7rem; border-radius: 6px;
@@ -1363,7 +1419,7 @@ function Get-DownloadPage {
     white-space: nowrap; flex-shrink: 0;
   }
   .dl-all-btn:hover { background: #fff; }
-  .dl-all-btn.busy { opacity: .45; cursor: default; }
+  .dl-all-btn.busy { opacity: .45; cursor: default; pointer-events: none; }
   .zip-all-btn {
     display: inline-flex; align-items: center; gap: .35rem;
     padding: .5rem 1rem;
@@ -1374,27 +1430,87 @@ function Get-DownloadPage {
     white-space: nowrap; flex-shrink: 0;
   }
   .zip-all-btn:hover { background: #4ade80; }
-  .zip-all-btn.busy { opacity: .45; cursor: default; }
-  .topbar-download-all { margin-right: .75rem; border-radius: 6px; border-left: none; }
-  .topbar-download-all:disabled { opacity: .45; cursor: default; }
-  .short-label { display: none; }
-  @media (max-width: 700px) {
-    .wide-label { display: none; }
-    .short-label { display: inline; }
-    .dl-all-btn, .zip-all-btn { padding: .5rem .7rem; }
-    .topbar-download-all { margin-right: .45rem; }
+  .zip-all-btn.busy { opacity: .45; cursor: default; pointer-events: none; }
+
+  /* ── Download Everything bar (always full label, centered) ── */
+  .dl-everything-bar {
+    display: flex; justify-content: center; align-items: center;
+    padding: .9rem 0 1.4rem;
   }
+  .dl-everything-btn {
+    display: inline-flex; align-items: center; gap: .5rem;
+    padding: .65rem 1.5rem;
+    font-family: var(--mono); font-size: .8rem; font-weight: 500;
+    color: #0d0d0f; background: #22c55e;
+    border: none; border-radius: var(--radius); cursor: pointer;
+    transition: background .15s, opacity .15s, box-shadow .15s;
+    white-space: nowrap; box-shadow: 0 0 0 0 rgba(34,197,94,0);
+  }
+  .dl-everything-btn:hover { background: #4ade80; box-shadow: 0 0 16px rgba(34,197,94,.35); }
+  .dl-everything-btn:disabled { opacity: .45; cursor: default; pointer-events: none; }
+
+  /* ── Zip progress panel ── */
+  .zip-progress-bar {
+    display: none; margin: 0 0 1rem;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); overflow: hidden;
+  }
+  .zip-progress-bar.visible { display: block; }
+  .zip-progress-header {
+    padding: .6rem 1rem; background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: .75rem; color: var(--muted);
+    display: flex; align-items: center; gap: .6rem;
+  }
+  .zip-progress-header strong { color: var(--accent2); }
+  .zip-progress-track { height: 3px; background: var(--border); position: relative; overflow: hidden; }
+  .zip-progress-fill { height: 100%; background: #22c55e; transition: width .3s ease; width: 0%; }
+  .zip-progress-rows { padding: .5rem 1rem .6rem; }
+  .zip-progress-row {
+    display: flex; align-items: center; gap: .6rem;
+    padding: .28rem 0; font-family: var(--mono); font-size: .76rem;
+    border-bottom: 1px solid rgba(255,255,255,.03);
+  }
+  .zip-progress-row:last-child { border-bottom: none; }
+  .zip-progress-ip { color: var(--accent2); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .zip-progress-status { flex-shrink: 0; font-size: .72rem; }
+  .zip-progress-status.waiting { color: var(--muted); }
+  .zip-progress-status.zipping { color: #f0a500; }
+  .zip-progress-status.done    { color: #22c55e; }
+  .zip-progress-status.error   { color: var(--danger); }
+
+  /* ── Empty state ── */
   .empty-state {
     text-align: center; color: var(--muted); padding: 5rem 2rem;
     font-family: var(--mono); font-size: .9rem;
     border: 1px dashed var(--border); border-radius: var(--radius);
   }
   .empty-state-icon { font-size: 2.5rem; margin-bottom: 1rem; }
-  td:nth-child(4) { width: 1%; white-space: nowrap; padding-right: 1rem; }
+
+  /* ── Mobile ── */
+  @media (max-width: 700px) {
+    /* Section action buttons: always show full label, shrink padding */
+    .dl-all-btn, .zip-all-btn { padding: .5rem .65rem; font-size: .7rem; gap: .25rem; }
+    /* Download Everything always shows full text — no collapse */
+    .dl-everything-btn { padding: .6rem 1.2rem; font-size: .78rem; }
+    /* Table: hide date column, shrink size column */
+    col.col-date { display: none; }
+    th:nth-child(3), td:nth-child(3) { display: none; }
+    col.col-size   { width: 5rem; }
+    col.col-action { width: 5.5rem; }
+    th { padding: .5rem .75rem; }
+    td { padding: .6rem .75rem; }
+    td:nth-child(4) { padding-right: .6rem; }
+    /* Copy URL button: icon only on very small screens */
+    .copy-url-btn { padding: .3rem .5rem; }
+    .copy-url-btn .url-label { display: none; }
+    /* IP header row: tighter */
+    .ip-header { padding: .75rem .85rem; gap: .5rem; }
+    .ip-header .ip-count { display: none; }
+  }
 </style></head>
 <body>
 <div class="topbar">
-  $(if ($files.Count -gt 0) { "<button type='button' id='downloadAllGroupsBtn' class='dl-all-btn topbar-download-all' onclick='downloadEverySenderZip(this)' title='Zip every sender group and download one archive'><span class='wide-label'>&#128230; Download All</span><span class='short-label'>&#128230; All</span></button>" })
   <span class="topbar-title">&#128229; Downloads $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "<span class='badge'>Secure</span>" } else { "<span class='badge'>Public</span>" })</span>
   <span class="topbar-meta">
     <span class="stat-pill">&#128196; <strong>$($files.Count)</strong> file$(if($files.Count -ne 1){'s'})</span>
@@ -1408,6 +1524,19 @@ function Get-DownloadPage {
 
 <div class="page">
   <div class="dl-content">
+    $(if ($files.Count -gt 0) {
+      "<div class='dl-everything-bar'><button type='button' id='downloadEverythingBtn' class='dl-everything-btn' onclick='downloadEverything(this)'>&#128230; Download Everything</button></div>" +
+      "<div class='zip-progress-bar' id='zipProgressBar'>" +
+        "<div class='zip-progress-header'><span>&#9889; Packaging</span> <strong id='zipProgressLabel'>0 / $($grouped.Count)</strong> <span>sender$(if($grouped.Count -ne 1){'s'})</span></div>" +
+        "<div class='zip-progress-track'><div class='zip-progress-fill' id='zipProgressFill'></div></div>" +
+        "<div class='zip-progress-rows' id='zipProgressRows'>" +
+          (($grouped | ForEach-Object {
+            $ip = [System.Net.WebUtility]::HtmlEncode($_.Name)
+            "<div class='zip-progress-row' id='zpr-$($ip -replace '[^a-zA-Z0-9]','_')'><span class='zip-progress-ip'>$ip</span><span class='zip-progress-status waiting' id='zprs-$($ip -replace '[^a-zA-Z0-9]','_')'>&#9675; Waiting</span></div>"
+          }) -join "") +
+        "</div>" +
+      "</div>"
+    })
     $groupHtml
   </div>
 </div>
@@ -1432,7 +1561,7 @@ function toggleGroup(id) {
   btn.setAttribute('aria-expanded', !collapsed);
 }
 function labelHtml(wide, short) {
-  return '<span class="wide-label">' + wide + '</span><span class="short-label">' + short + '</span>';
+  return wide; // no longer used for wide/short switching; kept for compat
 }
 function downloadAll(btn) {
   var groupId = btn.getAttribute('data-group');
@@ -1440,13 +1569,13 @@ function downloadAll(btn) {
   var files = JSON.parse(body.getAttribute('data-files'));
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
-  btn.innerHTML = labelHtml('&#8987; Downloading...', '&#8987; All');
+  btn.textContent = '\u23f3 Downloading\u2026';
   var i = 0;
   function next() {
     if (i >= files.length) {
       setTimeout(function() {
         btn.classList.remove('busy');
-        btn.innerHTML = labelHtml('&#11123; Download All', '&#11123; All');
+        btn.textContent = '\u23ec Download All';
       }, 1000);
       return;
     }
@@ -1465,7 +1594,7 @@ function zipAll(btn) {
   var ip = btn.getAttribute('data-ip');
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
-  btn.innerHTML = labelHtml('&#8987; Zipping...', '&#8987; All');
+  btn.textContent = '\u23f3 Zipping\u2026';
   fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw)
     .then(function(res) {
       if (!res.ok) throw new Error('Server returned ' + res.status);
@@ -1487,7 +1616,7 @@ function zipAll(btn) {
     .catch(function(err) { alert('Zip failed: ' + err.message); })
     .finally(function() {
       btn.classList.remove('busy');
-      btn.innerHTML = labelHtml('&#128230; Zip &amp; Download', '&#128230; All');
+      btn.textContent = '\u{1F4E6} Zip & Download';
     });
 }
 function sanitizeZipName(name) {
@@ -1498,17 +1627,51 @@ function filenameFromDisposition(header, fallback) {
   var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
   return match ? decodeURIComponent(match[1].replace(/"/g, '')) : fallback;
 }
-async function downloadEverySenderZip(btn) {
+async function downloadEverything(btn) {
   if (!SENDER_IPS.length) return;
-  var original = btn.innerHTML;
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
+
   btn.disabled = true;
+  document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.add('busy'); });
+
+  var progressBar   = document.getElementById('zipProgressBar');
+  var progressLabel = document.getElementById('zipProgressLabel');
+  var progressFill  = document.getElementById('zipProgressFill');
+  progressBar.classList.add('visible');
+
+  function safeId(ip) { return ip.replace(/[^a-zA-Z0-9]/g, '_'); }
+  function setStatus(ip, cls, html) {
+    var el = document.getElementById('zprs-' + safeId(ip));
+    if (!el) return;
+    el.className = 'zip-progress-status ' + cls;
+    el.innerHTML = html;
+  }
+
+  var done = 0;
+  for (var i = 0; i < SENDER_IPS.length; i++) {
+    var ip = SENDER_IPS[i];
+    setStatus(ip, 'zipping', '&#9881; Zipping&hellip;');
+    try {
+      var res = await fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      await res.blob();
+      done++;
+      setStatus(ip, 'done', '&#10003; Done');
+    } catch (err) {
+      done++;
+      setStatus(ip, 'error', '&#10007; Failed');
+    }
+    progressLabel.textContent = done + ' / ' + SENDER_IPS.length;
+    progressFill.style.width = Math.round(done / SENDER_IPS.length * 90) + '%';
+  }
+
   try {
-    btn.innerHTML = labelHtml('&#8987; Zipping all', '&#8987; All');
+    progressLabel.textContent = 'Packaging all\u2026';
     var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
     if (!res.ok) throw new Error('Server returned ' + res.status);
     var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
     var blob = await res.blob();
+    progressFill.style.width = '100%';
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
@@ -1518,10 +1681,16 @@ async function downloadEverySenderZip(btn) {
     document.body.removeChild(a);
     setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
   } catch (err) {
-    alert('Download All failed: ' + err.message);
+    alert('Download Everything failed: ' + err.message);
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = original;
+    setTimeout(function() {
+      btn.disabled = false;
+      document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.remove('busy'); });
+      progressBar.classList.remove('visible');
+      progressFill.style.width = '0%';
+      SENDER_IPS.forEach(function(ip) { setStatus(ip, 'waiting', '&#9675; Waiting'); });
+      progressLabel.textContent = '0 / ' + SENDER_IPS.length;
+    }, 1400);
   }
 }
 function copyUrl(btn) {
@@ -2342,8 +2511,8 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                 if ($allFiles.Count -eq 0) {
                     Send-Response $ctx "<h2>404 — No files found</h2>" -status 404
                 } else {
-                    $megaZip = Get-AllSendersZipBytes $allFiles
-                    Send-BytesResponse $ctx $megaZip.Bytes 'application/zip' $megaZip.DisplayName
+                    $megaZip = Get-OrBuildAllSendersZip $allFiles
+                    Send-FileStreamResponse $ctx $megaZip.ZipPath 'application/zip' $megaZip.DisplayName
                 }
             }
         }
@@ -2407,8 +2576,9 @@ function New-RequestRunspacePool {
         'Build-ZipCache',
         'Save-ZipCacheManifest',
         'Get-AllSendersZipFingerprint',
+        'Get-AllSendersZipCachePaths',
         'Get-OrBuildSenderZip',
-        'Get-AllSendersZipBytes',
+        'Get-OrBuildAllSendersZip',
         'Send-FileStreamResponse',
         'Send-BytesResponse',
         'Get-ServerSettingsObject',
