@@ -39,7 +39,7 @@ param(
 
     [Parameter(Mandatory = $true, HelpMessage = "The password to be used to access the download page. If the password is left as a blank string the server will run in unsecure mode.")]
     [AllowEmptyString()]
-    [string] $Password,
+    [string] $Password     = "",
 
     [Parameter(Mandatory = $false, HelpMessage = "Regex pattern upload filenames must match. Empty = no restriction.")]
     [AllowEmptyString()]
@@ -1276,7 +1276,7 @@ function Get-DownloadPage {
     }
 
     # Group files by sender IP
-    $grouped = $files | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name
+    $grouped = @($files | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name)
     $senderIpsJson = ConvertTo-Json -InputObject @($grouped | ForEach-Object { [string]$_.Name }) -Compress
     if (-not $senderIpsJson) { $senderIpsJson = "[]" }
 
