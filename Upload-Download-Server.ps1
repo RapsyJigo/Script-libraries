@@ -95,6 +95,25 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 # Simple in-memory session store  { token -> expiry }
 $Sessions = [System.Collections.Concurrent.ConcurrentDictionary[string,datetime]]::new()
 
+Add-Type -AssemblyName System.IO.Compression
+
+$script:UploadableFilesCache = @{
+    Folder = $null
+    Stamp  = $null
+    Files  = $null
+}
+
+$script:AllSendersZipCache = @{
+    Hash        = $null
+    Bytes       = $null
+    DisplayName = "all-senders.zip"
+    BuiltAt     = $null
+}
+$script:AllSendersZipLock = [object]::new()
+
+$script:FirewallRuleName = "ScriptLibs-UploadDownloadServer-TCP-$Port"
+$script:FirewallRuleCreated = $false
+
 function New-SessionToken {
     $bytes = New-Object byte[] 24
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
@@ -124,6 +143,12 @@ function Get-CookieToken([System.Net.HttpListenerRequest]$req) {
     $cookie = $req.Cookies["ds"]
     if ($cookie) { return $cookie.Value }
     return ""
+}
+
+function Get-SessionCookieAttributes([System.Net.HttpListenerRequest]$req) {
+    $attrs = "Path=/; HttpOnly; SameSite=Strict"
+    if ($req -and $req.IsSecureConnection) { $attrs += "; Secure" }
+    return $attrs
 }
 
 function Test-IsLocalRequest([System.Net.HttpListenerRequest]$req) {
@@ -172,9 +197,36 @@ function Get-SenderIpFromFileName([string]$filename) {
     return "Unknown"
 }
 
+function Clear-UploadableFilesCache {
+    $script:UploadableFilesCache.Folder = $null
+    $script:UploadableFilesCache.Stamp = $null
+    $script:UploadableFilesCache.Files = $null
+    $script:AllSendersZipCache.Hash = $null
+    $script:AllSendersZipCache.Bytes = $null
+    $script:AllSendersZipCache.BuiltAt = $null
+}
+
 function Get-UploadableFiles {
-    Get-ChildItem -Path $script:ServerSettings.UploadFolder -File |
-        Where-Object { $_.Name -notlike '.upload-parse-*' }
+    $folder = $script:ServerSettings.UploadFolder
+    $files = @(Get-ChildItem -Path $folder -File |
+        Where-Object { $_.Name -notlike '.upload-parse-*' -and $_.Name -notlike '*.part' })
+
+    $latestTicks = 0L
+    foreach ($f in $files) {
+        if ($f.LastWriteTimeUtc.Ticks -gt $latestTicks) { $latestTicks = $f.LastWriteTimeUtc.Ticks }
+    }
+    $stamp = "$($files.Count):$latestTicks"
+
+    if ($script:UploadableFilesCache.Folder -eq $folder -and
+        $script:UploadableFilesCache.Stamp -eq $stamp -and
+        $null -ne $script:UploadableFilesCache.Files) {
+        return $script:UploadableFilesCache.Files
+    }
+
+    $script:UploadableFilesCache.Folder = $folder
+    $script:UploadableFilesCache.Stamp = $stamp
+    $script:UploadableFilesCache.Files = $files
+    return $files
 }
 
 function New-UploadFolderTempPath([string]$prefix) {
@@ -264,24 +316,57 @@ function Test-ZipCacheValid([string]$manifestPath, [string]$zipPath, $fingerprin
     }
 }
 
+function Find-SevenZipExe {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if (${env:ProgramFiles}) { $candidates.Add((Join-Path ${env:ProgramFiles} '7-Zip\7z.exe')) }
+    if (${env:ProgramFiles(x86)}) { $candidates.Add((Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe')) }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $candidate }
+    }
+    $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
 function Build-ZipCache([string]$destZip, $zipFiles) {
     Write-ServerLog "Build-ZipCache: building $($zipFiles.Count) file(s) -> $destZip" -Level Info
-    Add-Type -AssemblyName System.IO.Compression
     $partPath = "$destZip.part"
     if (Test-Path -LiteralPath $partPath) { Remove-Item -LiteralPath $partPath -Force }
-    $fs = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew)
-    try {
-        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
-        foreach ($f in $zipFiles) {
-            $entry = $zip.CreateEntry($f.Name, [System.IO.Compression.CompressionLevel]::Optimal)
-            $es = $entry.Open()
+    $sevenZip = Find-SevenZipExe
+    if ($sevenZip) {
+        $listPath = "$partPath.files.txt"
+        $zipFolder = $script:ServerSettings.UploadFolder
+        try {
+            $zipFiles | ForEach-Object { $_.Name } | Set-Content -LiteralPath $listPath -Encoding UTF8
+            Push-Location $zipFolder
             try {
-                $src = [System.IO.File]::OpenRead($f.FullName)
-                try { $src.CopyTo($es) } finally { $src.Dispose() }
-            } finally { $es.Dispose() }
+                & $sevenZip a -tzip -mx=1 $partPath "@$listPath" | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "7-Zip exited with code $LASTEXITCODE."
+                }
+            } finally {
+                Pop-Location
+            }
+            Write-ServerLog "Build-ZipCache: used 7-Zip ($sevenZip)" -Level Debug
+        } finally {
+            Remove-Item -LiteralPath $listPath -Force -ErrorAction SilentlyContinue
         }
-        $zip.Dispose()
-    } finally { $fs.Dispose() }
+    } else {
+        $fs = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew)
+        try {
+            $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
+            try {
+                foreach ($f in $zipFiles) {
+                    $entry = $zip.CreateEntry($f.Name, [System.IO.Compression.CompressionLevel]::Fastest)
+                    $es = $entry.Open()
+                    try {
+                        $src = [System.IO.File]::OpenRead($f.FullName)
+                        try { $src.CopyTo($es) } finally { $src.Dispose() }
+                    } finally { $es.Dispose() }
+                }
+            } finally { $zip.Dispose() }
+        } finally { $fs.Dispose() }
+    }
     if (Test-Path -LiteralPath $destZip) { Remove-Item -LiteralPath $destZip -Force }
     Move-Item -LiteralPath $partPath -Destination $destZip -Force
     $zipSize = (Get-Item -LiteralPath $destZip).Length
@@ -291,6 +376,91 @@ function Build-ZipCache([string]$destZip, $zipFiles) {
 function Save-ZipCacheManifest([string]$manifestPath, $fingerprint) {
     @{ hash = (Get-ZipFingerprintHash $fingerprint) } | ConvertTo-Json -Compress |
         Set-Content -LiteralPath $manifestPath -Encoding UTF8 -NoNewline
+}
+
+function Get-AllSendersZipFingerprint($files) {
+    $files | Sort-Object Name | ForEach-Object {
+        [ordered]@{
+            name  = $_.Name
+            len   = $_.Length
+            mtime = $_.LastWriteTimeUtc.ToString('o')
+        }
+    }
+}
+
+function Get-OrBuildSenderZip([string]$senderIp, $zipFiles) {
+    $paths = Get-ZipCachePaths $senderIp
+    $fingerprint = Get-ZipSourceFingerprint $zipFiles
+    if (-not (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
+        Write-ServerLog "Zip cache miss for sender $senderIp — rebuilding" -Level Info
+        Build-ZipCache $paths.ZipPath $zipFiles
+        Save-ZipCacheManifest $paths.ManifestPath $fingerprint
+    } else {
+        Write-ServerLog "Zip cache hit for sender $senderIp -> $($paths.ZipPath)" -Level Debug
+    }
+    return $paths
+}
+
+function Get-AllSendersZipBytes($files) {
+    $fingerprint = Get-AllSendersZipFingerprint $files
+    $hash = Get-ZipFingerprintHash $fingerprint
+
+    [System.Threading.Monitor]::Enter($script:AllSendersZipLock)
+    try {
+        if ($script:AllSendersZipCache.Hash -eq $hash -and $null -ne $script:AllSendersZipCache.Bytes) {
+            Write-ServerLog "All-senders zip cache hit ($($script:AllSendersZipCache.Bytes.Length) bytes)" -Level Debug
+            return @{
+                Bytes       = $script:AllSendersZipCache.Bytes
+                DisplayName = $script:AllSendersZipCache.DisplayName
+            }
+        }
+
+        Write-ServerLog "All-senders zip cache miss — building mega zip" -Level Info
+        $grouped = $files | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name
+        $ms = New-Object System.IO.MemoryStream
+        try {
+            $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+            try {
+                $usedNames = @{}
+                foreach ($group in $grouped) {
+                    $senderIp = [string]$group.Name
+                    $senderZip = Get-OrBuildSenderZip $senderIp @($group.Group)
+                    $entryName = $senderZip.DisplayName
+                    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($entryName)
+                    $ext = [System.IO.Path]::GetExtension($entryName)
+                    if ([string]::IsNullOrEmpty($ext)) { $ext = ".zip" }
+                    $n = 1
+                    while ($usedNames.ContainsKey($entryName.ToLowerInvariant())) {
+                        $n++
+                        $entryName = "$baseName-$n$ext"
+                    }
+                    $usedNames[$entryName.ToLowerInvariant()] = $true
+
+                    $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::NoCompression)
+                    $entryStream = $entry.Open()
+                    try {
+                        $src = [System.IO.File]::OpenRead($senderZip.ZipPath)
+                        try { $src.CopyTo($entryStream) } finally { $src.Dispose() }
+                    } finally { $entryStream.Dispose() }
+                }
+            } finally { $zip.Dispose() }
+
+            $bytes = $ms.ToArray()
+            $script:AllSendersZipCache.Hash = $hash
+            $script:AllSendersZipCache.Bytes = $bytes
+            $script:AllSendersZipCache.DisplayName = "all-senders.zip"
+            $script:AllSendersZipCache.BuiltAt = Get-Date
+            Write-ServerLog "All-senders zip built in memory ($($bytes.Length) bytes)" -Level Ok
+            return @{
+                Bytes       = $bytes
+                DisplayName = $script:AllSendersZipCache.DisplayName
+            }
+        } finally {
+            $ms.Dispose()
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($script:AllSendersZipLock)
+    }
 }
 
 function Send-FileStreamResponse(
@@ -308,6 +478,8 @@ function Send-FileStreamResponse(
     $inStream = [System.IO.File]::OpenRead($filePath)
     try {
         $inStream.CopyTo($ctx.Response.OutputStream)
+    } catch [System.IO.IOException] {
+        Write-ServerLog "Send-FileStreamResponse: client disconnected while sending '$downloadFileName' — $($_.Exception.Message)" -Level Warn
     } finally {
         $inStream.Dispose()
         try { $ctx.Response.OutputStream.Close() } catch {}
@@ -369,8 +541,12 @@ function Set-ServerSettingsFromJson([string]$json, [ref]$errorMsg) {
             return $false
         }
         try {
-            $script:ServerSettings.UploadFolder = (New-Item -ItemType Directory -Force -Path $folder).FullName
-            Write-ServerLog "Upload folder changed to $($script:ServerSettings.UploadFolder)" -Level Info
+            $newFolder = (New-Item -ItemType Directory -Force -Path $folder).FullName
+            if ($newFolder -ne $script:ServerSettings.UploadFolder) {
+                $script:ServerSettings.UploadFolder = $newFolder
+                Clear-UploadableFilesCache
+                Write-ServerLog "Upload folder changed to $($script:ServerSettings.UploadFolder)" -Level Info
+            }
         } catch {
             $errorMsg.Value = "Invalid upload folder: $($_.Exception.Message)"
             Write-ServerLog "Invalid upload folder '$folder': $($_.Exception.Message)" -Level Error
@@ -1071,6 +1247,8 @@ function Get-DownloadPage {
 
     # Group files by sender IP
     $grouped = $files | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name
+    $senderIpsJson = ConvertTo-Json -InputObject @($grouped | ForEach-Object { [string]$_.Name }) -Compress
+    if (-not $senderIpsJson) { $senderIpsJson = "[]" }
 
     $groupHtml = if ($files.Count -eq 0) {
         "<div class='empty-state'><div class='empty-state-icon'>&#128228;</div>No files uploaded yet.<br>Head to the upload page to send some files.</div>"
@@ -1098,8 +1276,8 @@ function Get-DownloadPage {
       <span class="ip-count badge">$count file$(if($count -ne 1){'s'})</span>
       <span class="ip-chevron" id="chev-$groupId">&#9650;</span>
     </button>
-    <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files from this sender">&#11123; Download All</button>
-    <button class="zip-all-btn" onclick="zipAll(this)" data-ip="$ip" title="Zip and download all files from this sender">&#128230; Zip &amp; Download</button>
+    <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files from this sender"><span class="wide-label">&#11123; Download All</span><span class="short-label">&#11123; All</span></button>
+    <button class="zip-all-btn" onclick="zipAll(this)" data-ip="$ip" title="Zip and download all files from this sender"><span class="wide-label">&#128230; Zip &amp; Download</span><span class="short-label">&#128230; All</span></button>
   </div>
   <div class="ip-body" id="$groupId" data-files="[$encListJson]">
     <table>
@@ -1197,6 +1375,15 @@ function Get-DownloadPage {
   }
   .zip-all-btn:hover { background: #4ade80; }
   .zip-all-btn.busy { opacity: .45; cursor: default; }
+  .topbar-download-all { margin-right: .75rem; border-radius: 6px; border-left: none; }
+  .topbar-download-all:disabled { opacity: .45; cursor: default; }
+  .short-label { display: none; }
+  @media (max-width: 700px) {
+    .wide-label { display: none; }
+    .short-label { display: inline; }
+    .dl-all-btn, .zip-all-btn { padding: .5rem .7rem; }
+    .topbar-download-all { margin-right: .45rem; }
+  }
   .empty-state {
     text-align: center; color: var(--muted); padding: 5rem 2rem;
     font-family: var(--mono); font-size: .9rem;
@@ -1207,6 +1394,7 @@ function Get-DownloadPage {
 </style></head>
 <body>
 <div class="topbar">
+  $(if ($files.Count -gt 0) { "<button type='button' id='downloadAllGroupsBtn' class='dl-all-btn topbar-download-all' onclick='downloadEverySenderZip(this)' title='Zip every sender group and download one archive'><span class='wide-label'>&#128230; Download All</span><span class='short-label'>&#128230; All</span></button>" })
   <span class="topbar-title">&#128229; Downloads $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "<span class='badge'>Secure</span>" } else { "<span class='badge'>Public</span>" })</span>
   <span class="topbar-meta">
     <span class="stat-pill">&#128196; <strong>$($files.Count)</strong> file$(if($files.Count -ne 1){'s'})</span>
@@ -1224,7 +1412,10 @@ function Get-DownloadPage {
   </div>
 </div>
 
-<script>var DL_PASSWORD = $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "'" + ($script:ServerSettings.Password -replace "'", "\\x27" -replace '\\', '\\\\') + "'" } else { 'null' });</script>
+<script>
+var DL_PASSWORD = $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "'" + ($script:ServerSettings.Password -replace "'", "\\x27" -replace '\\', '\\\\') + "'" } else { 'null' });
+var SENDER_IPS = $senderIpsJson;
+</script>
 <script>
 if (DL_PASSWORD) {
   document.querySelectorAll('a.dl-href').forEach(function(a) {
@@ -1240,19 +1431,22 @@ function toggleGroup(id) {
   chev.classList.toggle('collapsed', collapsed);
   btn.setAttribute('aria-expanded', !collapsed);
 }
+function labelHtml(wide, short) {
+  return '<span class="wide-label">' + wide + '</span><span class="short-label">' + short + '</span>';
+}
 function downloadAll(btn) {
   var groupId = btn.getAttribute('data-group');
   var body = document.getElementById(groupId);
   var files = JSON.parse(body.getAttribute('data-files'));
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
-  btn.innerHTML = '&#8987; Downloading…';
+  btn.innerHTML = labelHtml('&#8987; Downloading...', '&#8987; All');
   var i = 0;
   function next() {
     if (i >= files.length) {
       setTimeout(function() {
         btn.classList.remove('busy');
-        btn.innerHTML = '&#11123; Download All';
+        btn.innerHTML = labelHtml('&#11123; Download All', '&#11123; All');
       }, 1000);
       return;
     }
@@ -1271,7 +1465,7 @@ function zipAll(btn) {
   var ip = btn.getAttribute('data-ip');
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
-  btn.innerHTML = '&#8987; Zipping…';
+  btn.innerHTML = labelHtml('&#8987; Zipping...', '&#8987; All');
   fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw)
     .then(function(res) {
       if (!res.ok) throw new Error('Server returned ' + res.status);
@@ -1293,8 +1487,42 @@ function zipAll(btn) {
     .catch(function(err) { alert('Zip failed: ' + err.message); })
     .finally(function() {
       btn.classList.remove('busy');
-      btn.innerHTML = '&#128230; Zip &amp; Download';
+      btn.innerHTML = labelHtml('&#128230; Zip &amp; Download', '&#128230; All');
     });
+}
+function sanitizeZipName(name) {
+  return String(name || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown';
+}
+function filenameFromDisposition(header, fallback) {
+  var cd = header || '';
+  var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
+  return match ? decodeURIComponent(match[1].replace(/"/g, '')) : fallback;
+}
+async function downloadEverySenderZip(btn) {
+  if (!SENDER_IPS.length) return;
+  var original = btn.innerHTML;
+  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
+  btn.disabled = true;
+  try {
+    btn.innerHTML = labelHtml('&#8987; Zipping all', '&#8987; All');
+    var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
+    if (!res.ok) throw new Error('Server returned ' + res.status);
+    var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
+    var blob = await res.blob();
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+  } catch (err) {
+    alert('Download All failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = original;
+  }
 }
 function copyUrl(btn) {
   var name = btn.getAttribute('data-name');
@@ -1622,136 +1850,178 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         return @{ Names = @(); Error = $null }
     }
 
-    # ── Streaming multipart parser ────────────────────────────────────────────
-    # Boundary markers as bytes
-    [byte[]]$boundaryBytes  = [System.Text.Encoding]::ASCII.GetBytes("--$boundary")
-    [byte[]]$delimBytes     = [System.Text.Encoding]::ASCII.GetBytes("`r`n--$boundary")
-    [byte[]]$dblCRLF        = [byte[]](13,10,13,10)
-    [byte[]]$CRLF           = [byte[]](13,10)
-
+    [byte[]]$delimiterBytes = [System.Text.Encoding]::ASCII.GetBytes("`r`n--$boundary")
+    $boundaryLine = "--$boundary"
     $savedNames = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Generic.List[byte]]::new()
+    $bodyCounter = @{ Value = 0L }
 
-    # Stream the entire request into a temp file in the upload folder (avoids 2 GB RAM limit)
-    $tmpPath = New-UploadFolderTempPath 'upload-parse'
-    Write-ServerLog "Save-UploadedFile: streaming body to temp $tmpPath" -Level Debug
+    function Add-BodyBytes([int]$count) {
+        if ($count -le 0) { return }
+        $bodyCounter.Value += $count
+        if ($limit -gt 0 -and $bodyCounter.Value -gt $limit) {
+            throw [System.IO.IOException]::new("Upload exceeds maximum size ($(Format-ByteSize $limit)).")
+        }
+    }
+
+    function Read-ParserByte {
+        if ($pending.Count -gt 0) {
+            $b = $pending[0]
+            $pending.RemoveAt(0)
+            return [int]$b
+        }
+        $b = $req.InputStream.ReadByte()
+        if ($b -ge 0) { Add-BodyBytes 1 }
+        return $b
+    }
+
+    function Read-ParserBlock([byte[]]$buffer, [int]$offset, [int]$count) {
+        $copied = 0
+        while ($pending.Count -gt 0 -and $copied -lt $count) {
+            $buffer[$offset + $copied] = $pending[0]
+            $pending.RemoveAt(0)
+            $copied++
+        }
+        if ($copied -lt $count) {
+            $read = $req.InputStream.Read($buffer, $offset + $copied, $count - $copied)
+            if ($read -gt 0) {
+                Add-BodyBytes $read
+                $copied += $read
+            }
+        }
+        return $copied
+    }
+
+    function Read-MultipartLine {
+        $line = [System.Collections.Generic.List[byte]]::new()
+        while ($true) {
+            $b = Read-ParserByte
+            if ($b -lt 0) {
+                if ($line.Count -eq 0) { return $null }
+                break
+            }
+            $line.Add([byte]$b)
+            if ($line.Count -gt 65536) {
+                throw [System.IO.IOException]::new("Multipart header line is too large.")
+            }
+            if ($b -eq 10) { break }
+        }
+        return [System.Text.Encoding]::ASCII.GetString($line.ToArray())
+    }
+
+    function Read-MultipartHeaders {
+        $headers = New-Object System.Text.StringBuilder
+        while ($true) {
+            $line = Read-MultipartLine
+            if ($null -eq $line) { return $null }
+            if ($line -eq "`r`n" -or $line -eq "`n") { return $headers.ToString() }
+            if ($headers.Length + $line.Length -gt 65536) {
+                throw [System.IO.IOException]::new("Multipart headers are too large.")
+            }
+            [void]$headers.Append($line)
+        }
+    }
+
+    function Stream-FileUntilDelimiter([System.IO.Stream]$destStream) {
+        [byte[]]$buffer = New-Object byte[] (65536 + $delimiterBytes.Length)
+        $carry = 0
+        $fileBytes = 0L
+        while ($true) {
+            $read = Read-ParserBlock $buffer $carry 65536
+            if ($read -le 0) {
+                throw [System.IO.IOException]::new("Multipart delimiter was not found.")
+            }
+            $windowLen = $carry + $read
+            $idx = Find-IndexOfBytes -buffer $buffer -length $windowLen -needle $delimiterBytes -startIndex 0
+            if ($idx -ge 0) {
+                if ($idx -gt 0 -and $null -ne $destStream) {
+                    $destStream.Write($buffer, 0, $idx)
+                    $fileBytes += $idx
+                }
+                if ($limit -gt 0 -and $fileBytes -gt $limit) {
+                    throw [System.IO.IOException]::new("File exceeds maximum upload size ($(Format-ByteSize $limit)).")
+                }
+                $after = $idx + $delimiterBytes.Length
+                for ($i = $after; $i -lt $windowLen; $i++) {
+                    $pending.Add($buffer[$i])
+                }
+                return $fileBytes
+            }
+
+            $keep = [Math]::Min($delimiterBytes.Length - 1, $windowLen)
+            $writeLen = $windowLen - $keep
+            if ($writeLen -gt 0 -and $null -ne $destStream) {
+                $destStream.Write($buffer, 0, $writeLen)
+                $fileBytes += $writeLen
+            }
+            if ($limit -gt 0 -and $fileBytes -gt $limit) {
+                throw [System.IO.IOException]::new("File exceeds maximum upload size ($(Format-ByteSize $limit)).")
+            }
+            if ($keep -gt 0) {
+                [Array]::Copy($buffer, $writeLen, $buffer, 0, $keep)
+            }
+            $carry = $keep
+        }
+    }
+
     try {
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $tmpWrite = [System.IO.File]::OpenWrite($tmpPath)
-        try { $req.InputStream.CopyTo($tmpWrite) } finally { $tmpWrite.Dispose() }
-        $sw.Stop()
-        $tmpSize = (Get-Item -LiteralPath $tmpPath).Length
-        Write-ServerLog "Save-UploadedFile: body written ($tmpSize bytes) in $($sw.ElapsedMilliseconds) ms" -Level Info
+        $firstLine = Read-MultipartLine
+        if ($null -eq $firstLine -or $firstLine.TrimEnd([char[]]"`r`n") -ne $boundaryLine) {
+            return @{ Names = $savedNames; Error = $null }
+        }
 
-        # Now parse the temp file using a FileStream — never loads the whole body into RAM
-        $fs = [System.IO.File]::OpenRead($tmpPath)
-        try {
-            $fileLen = $fs.Length
-            Write-ServerLog "Save-UploadedFile: parsing multipart ($fileLen bytes on disk)" -Level Debug
+        while ($true) {
+            $hdrStr = Read-MultipartHeaders
+            if ($null -eq $hdrStr) { break }
 
-            # Helper: read a small slice of the stream into a string (for headers only)
-            function Read-StreamSlice([System.IO.FileStream]$stream, [long]$start, [long]$length) {
-                [byte[]]$slice = New-Object byte[] $length
-                $stream.Position = $start
-                $stream.Read($slice, 0, $length) | Out-Null
-                return [System.Text.Encoding]::UTF8.GetString($slice)
-            }
+            $origName = $null
+            if ($hdrStr -match 'filename="([^"]*)"') { $origName = $Matches[1] }
 
-            # Helper: copy a section of the FileStream directly to a destination FileStream
-            function Copy-StreamSection([System.IO.FileStream]$src, [long]$start, [long]$length, [System.IO.FileStream]$dst) {
-                $src.Position = $start
-                [byte[]]$buf = New-Object byte[] 65536   # 64 KB copy buffer
-                $remaining = $length
-                while ($remaining -gt 0) {
-                    $toRead = [int][Math]::Min([int64]$buf.Length, $remaining)
-                    $read = $src.Read($buf, 0, $toRead)
-                    if ($read -eq 0) { break }
-                    $dst.Write($buf, 0, $read)
-                    $remaining -= $read
+            if ([string]::IsNullOrEmpty($origName)) {
+                [void](Stream-FileUntilDelimiter $null)
+            } else {
+                $nameCheck = Test-UploadFileName $origName
+                if (-not $nameCheck.Ok) {
+                    return @{ Names = $savedNames; Error = $nameCheck.Message }
                 }
-            }
 
-            # Locate first boundary
-            $cur = Find-BytePatternInFileStream $fs $boundaryBytes 0
-            if ($cur -lt 0) { return @{ Names = $savedNames; Error = $null } }
-            $cur += $boundaryBytes.Length   # skip "--boundary"
+                $safeName = ([System.IO.Path]::GetFileName($origName)) -replace '[^\w\.\-_() ]',''
+                if (-not $safeName) { $safeName = "upload_" + (Get-Date -Format 'yyyyMMddHHmmss') }
+                $base = [System.IO.Path]::GetFileNameWithoutExtension($safeName)
+                $ext  = [System.IO.Path]::GetExtension($safeName)
+                $safeIP = $senderIP -replace '[:\\/]','-'
+                $safeName = "${base}-${safeIP}${ext}"
+                $destPath = Join-Path $script:ServerSettings.UploadFolder $safeName
+                $idx = 1
+                while (Test-Path $destPath) {
+                    $destPath = Join-Path $script:ServerSettings.UploadFolder "${base}-${safeIP}_${idx}${ext}"; $idx++
+                }
 
-            while ($true) {
-                if ($cur + 1 -ge $fileLen) { break }
-                # Check for final boundary ("--")
-                [byte[]]$twoBytes = New-Object byte[] 2
-                $fs.Position = $cur; $fs.Read($twoBytes, 0, 2) | Out-Null
-                if ($twoBytes[0] -eq 45 -and $twoBytes[1] -eq 45) { break }
-                $cur += 2   # skip CRLF after boundary line
-
-                # Find end of part headers (double CRLF)
-                $hdrEnd = Find-BytePatternInFileStream $fs $dblCRLF $cur
-                if ($hdrEnd -lt 0) { break }
-
-                $hdrLen = [int]($hdrEnd - $cur)
-                if ($hdrLen -lt 0 -or $hdrLen -gt 65536) { break }
-                $hdrStr    = Read-StreamSlice $fs $cur $hdrLen
-                $dataStart = $hdrEnd + 4   # skip double-CRLF
-
-                # Find next delimiter (CRLF + "--" + boundary)
-                $nextDelim = Find-BytePatternInFileStream $fs $delimBytes $dataStart
-                if ($nextDelim -lt 0) { break }
-
-                $dataLen = $nextDelim - $dataStart
-
-                if ($limit -gt 0 -and $dataLen -gt $limit) {
-                    return @{
-                        Names = @()
-                        Error = "File exceeds maximum upload size ($(Format-ByteSize $limit))."
+                $partDest = "$destPath.$([Guid]::NewGuid().ToString('N')).part"
+                try {
+                    $destStream = [System.IO.File]::OpenWrite($partDest)
+                    try {
+                        $dataLen = Stream-FileUntilDelimiter $destStream
+                    } finally { $destStream.Dispose() }
+                    Move-Item -LiteralPath $partDest -Destination $destPath -Force
+                    $savedName = [System.IO.Path]::GetFileName($destPath)
+                    $savedNames.Add($savedName)
+                    Clear-UploadableFilesCache
+                    Write-ServerLog "Save-UploadedFile: saved '$savedName' ($dataLen bytes) -> $destPath" -Level Ok
+                } catch {
+                    if (Test-Path -LiteralPath $partDest) {
+                        Remove-Item -LiteralPath $partDest -Force -ErrorAction SilentlyContinue
                     }
+                    Write-ServerLog "Save-UploadedFile: failed writing '$origName' — $($_.Exception.Message)" -Level Error
+                    throw
                 }
-
-                if ($hdrStr -match 'filename="([^"]*)"') {
-                    $origName = $Matches[1]
-                    if ($origName -ne '') {
-                        $nameCheck = Test-UploadFileName $origName
-                        if (-not $nameCheck.Ok) {
-                            return @{ Names = $savedNames; Error = $nameCheck.Message }
-                        }
-                        $safeName = ([System.IO.Path]::GetFileName($origName)) -replace '[^\w\.\-_() ]',''
-                        if (-not $safeName) { $safeName = "upload_" + (Get-Date -Format 'yyyyMMddHHmmss') }
-                        $base = [System.IO.Path]::GetFileNameWithoutExtension($safeName)
-                        $ext  = [System.IO.Path]::GetExtension($safeName)
-                        $safeIP = $senderIP -replace '[:\\/]','-'
-                        $safeName = "${base}-${safeIP}${ext}"
-                        $destPath = Join-Path $script:ServerSettings.UploadFolder $safeName
-                        $idx = 1
-                        while (Test-Path $destPath) {
-                            $destPath = Join-Path $script:ServerSettings.UploadFolder "${base}-${safeIP}_${idx}${ext}"; $idx++
-                        }
-                        $partDest = "$destPath.$([Guid]::NewGuid().ToString('N')).part"
-                        try {
-                            $destStream = [System.IO.File]::OpenWrite($partDest)
-                            try {
-                                if ($dataLen -gt 0) {
-                                    Copy-StreamSection $fs $dataStart $dataLen $destStream
-                                }
-                            } finally { $destStream.Dispose() }
-                            Move-Item -LiteralPath $partDest -Destination $destPath -Force
-                            $savedName = [System.IO.Path]::GetFileName($destPath)
-                            $savedNames.Add($savedName)
-                            Write-ServerLog "Save-UploadedFile: saved '$savedName' ($dataLen bytes) -> $destPath" -Level Ok
-                        } catch {
-                            if (Test-Path -LiteralPath $partDest) {
-                                Remove-Item -LiteralPath $partDest -Force -ErrorAction SilentlyContinue
-                            }
-                            Write-ServerLog "Save-UploadedFile: failed writing '$origName' — $($_.Exception.Message)" -Level Error
-                            throw
-                        }
-                    }
-                }
-
-                # Advance: skip CRLF + "--" + boundary
-                $cur = $nextDelim + 2 + 2 + $boundaryBytes.Length
             }
-        } finally { $fs.Dispose() }
-    } finally {
-        Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
-        Write-ServerLog "Save-UploadedFile: removed temp $tmpPath" -Level Debug
+
+            $suffix = Read-MultipartLine
+            if ($null -eq $suffix -or $suffix.StartsWith("--")) { break }
+        }
+    } catch [System.IO.IOException] {
+        return @{ Names = @(); Error = $_.Exception.Message }
     }
 
     Write-ServerLog "Save-UploadedFile: done — $($savedNames.Count) file(s) saved" -Level Ok
@@ -1759,29 +2029,64 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
 }
 
 # ── HTTP Server ──────────────────────────────────────────────────────────────
+function Add-ServerFirewallRule {
+    try {
+        $existing = Get-NetFirewallRule -DisplayName $script:FirewallRuleName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-ServerLog "Firewall: rule already present ($script:FirewallRuleName)" -Level Debug
+            return
+        }
+        New-NetFirewallRule -DisplayName $script:FirewallRuleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port | Out-Null
+        $script:FirewallRuleCreated = $true
+        Write-ServerLog "Firewall: added TCP inbound rule for port $Port" -Level Info
+    } catch {
+        Write-ServerLog "Firewall: could not create TCP port rule — $($_.Exception.Message)" -Level Warn
+    }
+}
+
+function Send-BytesResponse(
+    [System.Net.HttpListenerContext]$ctx,
+    [byte[]]$bytes,
+    [string]$contentType,
+    [string]$downloadFileName
+) {
+    Write-ServerLog "Send-BytesResponse: '$downloadFileName' ($($bytes.Length) bytes, $contentType)" -Level Info
+    $encName = [Uri]::EscapeDataString($downloadFileName)
+    $ctx.Response.ContentType = $contentType
+    $ctx.Response.AddHeader("Content-Disposition", "attachment; filename*=UTF-8''$encName")
+    $ctx.Response.ContentLength64 = $bytes.Length
+    try {
+        $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    } catch [System.IO.IOException] {
+        Write-ServerLog "Send-BytesResponse: client disconnected while sending '$downloadFileName' — $($_.Exception.Message)" -Level Warn
+    } finally {
+        try { $ctx.Response.OutputStream.Close() } catch {}
+    }
+}
+
+function Remove-ServerFirewallRule {
+    if (-not $script:FirewallRuleCreated) { return }
+    try {
+        Remove-NetFirewallRule -DisplayName $script:FirewallRuleName -ErrorAction SilentlyContinue
+        $script:FirewallRuleCreated = $false
+        Write-ServerLog "Firewall: removed rule $script:FirewallRuleName" -Level Info
+    } catch {
+        Write-ServerLog "Firewall: could not remove rule $script:FirewallRuleName — $($_.Exception.Message)" -Level Warn
+    }
+}
+
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://*:$Port/")
 
-try {
-  $result = Get-NetFirewallRule -DisplayName "Powershell"
-  if (-not $result) {
-    New-NetFirewallRule -DisplayName "Powershell" -Direction Inbound -Program "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -Action Allow | Out-Null
-    Write-ServerLog "Firewall: added inbound rule for PowerShell" -Level Info
-  } else {
-    Write-ServerLog "Firewall: PowerShell inbound rule already present" -Level Debug
-  }
-}
-catch {
-  New-NetFirewallRule -DisplayName "Powershell" -Direction Inbound -Program "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -Action Allow | Out-Null
-  Write-ServerLog "Firewall: created rule (Get-NetFirewallRule unavailable)" -Level Warn
-}
-
+Add-ServerFirewallRule
+$script:FirewallExitEvent = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Remove-ServerFirewallRule } -ErrorAction SilentlyContinue
 
 try {
     $listener.Start()
     Write-ServerLog "HttpListener started on port $Port" -Level Ok
 } catch {
     Write-ServerLog "Cannot start listener on port $Port — $($_.Exception.Message)" -Level Error
+    Remove-ServerFirewallRule
     exit 1
 }
 
@@ -1799,7 +2104,6 @@ try {
 $portOpen = $false
 try {
     $probe    = Invoke-WebRequest "https://portchecker.io/api/me/${port}" -UseBasicParsing -TimeoutSec 10
-    # portchecker returns JSON: {"status":"open"} or {"status":"closed"}
     $portOpen = $probe.Content -match 'True'
 } catch {
     $portOpen = $false
@@ -1861,15 +2165,7 @@ function Send-Redirect([System.Net.HttpListenerContext]$ctx, [string]$url) {
     try { $ctx.Response.OutputStream.Close() } catch {}
 }
 
-Write-ServerLog "Entering request loop (listening)" -Level Ok
-
-while ($listener.IsListening) {
-    $ctx = $null
-    try { $ctx = $listener.GetContext() } catch {
-        Write-ServerLog "GetContext ended: $($_.Exception.Message)" -Level Warn
-        break
-    }
-
+function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
     $req  = $ctx.Request
     $path = $req.Url.AbsolutePath.TrimEnd('/').ToLower()
     $method = $req.HttpMethod.ToUpper()
@@ -1993,7 +2289,7 @@ while ($listener.IsListening) {
                     $expiry = (Get-Date).AddHours(4)
                     $Sessions[$token] = $expiry
                     Write-ServerLog "Download login OK from $($req.RemoteEndPoint.Address) (session until $($expiry.ToString('HH:mm:ss')))" -Level Ok
-                    $ctx.Response.AppendHeader("Set-Cookie", "ds=$token; Path=/; HttpOnly; SameSite=Strict")
+                    $ctx.Response.AppendHeader("Set-Cookie", "ds=$token; $(Get-SessionCookieAttributes $req)")
                     Send-Redirect $ctx "/download"
                 } else {
                     Write-ServerLog "Download login failed from $($req.RemoteEndPoint.Address)" -Level Warn
@@ -2009,7 +2305,7 @@ while ($listener.IsListening) {
                 $dummy = [datetime]::MinValue
                 $Sessions.TryRemove($token, [ref]$dummy) | Out-Null
             }
-            $ctx.Response.AppendHeader("Set-Cookie", "ds=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly")
+            $ctx.Response.AppendHeader("Set-Cookie", "ds=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; $(Get-SessionCookieAttributes $req)")
             Send-Redirect $ctx "/download"
         }
 
@@ -2034,6 +2330,24 @@ while ($listener.IsListening) {
             }
         }
 
+        # ── GET /download/zip-all ────────────────────────────────────────────
+        elseif ($path -eq "/download/zip-all") {
+            $token     = Get-CookieToken $req
+            $quickpass = $req.QueryString["password"]
+            $authorized = [string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token) -or ($quickpass -eq $script:ServerSettings.Password)
+            if (-not $authorized) {
+                Send-Redirect $ctx "/download"
+            } else {
+                $allFiles = @(Get-UploadableFiles)
+                if ($allFiles.Count -eq 0) {
+                    Send-Response $ctx "<h2>404 — No files found</h2>" -status 404
+                } else {
+                    $megaZip = Get-AllSendersZipBytes $allFiles
+                    Send-BytesResponse $ctx $megaZip.Bytes 'application/zip' $megaZip.DisplayName
+                }
+            }
+        }
+
         # ── GET /download/zip?ip=... ─────────────────────────────────────────
         elseif ($path -eq "/download/zip") {
             $token     = Get-CookieToken $req
@@ -2047,15 +2361,7 @@ while ($listener.IsListening) {
                 if ($zipFiles.Count -eq 0) {
                     Send-Response $ctx "<h2>404 — No files found for that sender</h2>" -status 404
                 } else {
-                    $paths = Get-ZipCachePaths $senderIp
-                    $fingerprint = Get-ZipSourceFingerprint $zipFiles
-                    if (-not (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
-                        Write-ServerLog "Zip cache miss for sender $senderIp — rebuilding" -Level Info
-                        Build-ZipCache $paths.ZipPath $zipFiles
-                        Save-ZipCacheManifest $paths.ManifestPath $fingerprint
-                    } else {
-                        Write-ServerLog "Zip cache hit for sender $senderIp -> $($paths.ZipPath)" -Level Debug
-                    }
+                    $paths = Get-OrBuildSenderZip $senderIp $zipFiles
                     Send-FileStreamResponse $ctx $paths.ZipPath 'application/zip' $paths.DisplayName
                 }
             }
@@ -2072,4 +2378,130 @@ while ($listener.IsListening) {
         Write-ServerLog $_.ScriptStackTrace -Level Debug
         try { Send-Response $ctx "<h2>500 — Internal Server Error</h2>" -status 500 } catch {}
     }
+}
+
+function New-RequestRunspacePool {
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $functionNames = @(
+        'Write-ServerLog',
+        'New-SessionToken',
+        'Test-Session',
+        'Get-CookieToken',
+        'Get-SessionCookieAttributes',
+        'Test-IsLocalRequest',
+        'Test-RegexPattern',
+        'Test-UploadFileName',
+        'Format-ByteSize',
+        'Get-SenderIpFromFileName',
+        'Clear-UploadableFilesCache',
+        'Get-UploadableFiles',
+        'New-UploadFolderTempPath',
+        'Find-IndexOfBytes',
+        'Find-BytePatternInFileStream',
+        'Get-ZipCacheDir',
+        'Get-ZipCachePaths',
+        'Get-ZipSourceFingerprint',
+        'Get-ZipFingerprintHash',
+        'Test-ZipCacheValid',
+        'Find-SevenZipExe',
+        'Build-ZipCache',
+        'Save-ZipCacheManifest',
+        'Get-AllSendersZipFingerprint',
+        'Get-OrBuildSenderZip',
+        'Get-AllSendersZipBytes',
+        'Send-FileStreamResponse',
+        'Send-BytesResponse',
+        'Get-ServerSettingsObject',
+        'Get-ServerSettingsJson',
+        'Set-ServerSettingsFromJson',
+        'Get-UploadPage',
+        'Get-LoginPage',
+        'Get-DownloadPage',
+        'Get-AdminPage',
+        'Save-UploadedFile',
+        'Send-Response',
+        'Send-Redirect',
+        'Handle-HttpContext'
+    )
+    foreach ($name in $functionNames) {
+        $cmd = Get-Command $name -CommandType Function -ErrorAction Stop
+        $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $cmd.Definition))
+    }
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('Sessions', $Sessions, 'Shared session store'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ServerSettings', $script:ServerSettings, 'Shared server settings'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('UploadableFilesCache', $script:UploadableFilesCache, 'Shared upload listing cache'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('AllSendersZipCache', $script:AllSendersZipCache, 'Shared all-senders zip cache'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('AllSendersZipLock', $script:AllSendersZipLock, 'Shared all-senders zip cache lock'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CSS_SHARED', $CSS_SHARED, 'Shared CSS template'))
+    $maxRunspaces = [Math]::Max(4, [Environment]::ProcessorCount * 4)
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxRunspaces, $iss, $Host)
+    $pool.Open()
+    return $pool
+}
+
+function Start-RequestWorker([System.Net.HttpListenerContext]$ctx) {
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.RunspacePool = $script:RequestRunspacePool
+    [void]$ps.AddScript('param($ctx) Handle-HttpContext $ctx').AddArgument($ctx)
+    $async = $ps.BeginInvoke()
+    $script:ActiveRequestWorkers.Add([pscustomobject]@{ PowerShell = $ps; Async = $async })
+}
+
+function Clear-CompletedRequestWorkers {
+    for ($i = $script:ActiveRequestWorkers.Count - 1; $i -ge 0; $i--) {
+        $worker = $script:ActiveRequestWorkers[$i]
+        if (-not $worker.Async.IsCompleted) { continue }
+        try { $worker.PowerShell.EndInvoke($worker.Async) } catch {
+            Write-ServerLog "Request worker failed: $($_.Exception.Message)" -Level Error
+        } finally {
+            $worker.PowerShell.Dispose()
+            $script:ActiveRequestWorkers.RemoveAt($i)
+        }
+    }
+}
+
+$script:RequestRunspacePool = New-RequestRunspacePool
+$script:ActiveRequestWorkers = [System.Collections.Generic.List[object]]::new()
+
+Write-ServerLog "Entering request loop (listening)" -Level Ok
+
+try {
+    while ($listener.IsListening) {
+        $async = $null
+        try {
+            $async = $listener.BeginGetContext($null, $null)
+            while ($listener.IsListening -and -not $async.AsyncWaitHandle.WaitOne(250)) { }
+            if (-not $listener.IsListening) { break }
+            $ctx = $listener.EndGetContext($async)
+        } catch {
+            if ($listener.IsListening) {
+                Write-ServerLog "BeginGetContext/EndGetContext ended: $($_.Exception.Message)" -Level Warn
+            }
+            break
+        } finally {
+            if ($async -and $async.AsyncWaitHandle) { $async.AsyncWaitHandle.Close() }
+        }
+
+        Clear-CompletedRequestWorkers
+        Start-RequestWorker $ctx
+    }
+} finally {
+    Clear-CompletedRequestWorkers
+    foreach ($worker in @($script:ActiveRequestWorkers)) {
+        try { $worker.PowerShell.EndInvoke($worker.Async) } catch {
+            Write-ServerLog "Request worker failed during shutdown: $($_.Exception.Message)" -Level Error
+        } finally {
+            $worker.PowerShell.Dispose()
+        }
+    }
+    if ($script:RequestRunspacePool) {
+        $script:RequestRunspacePool.Close()
+        $script:RequestRunspacePool.Dispose()
+    }
+    try {
+        if ($listener.IsListening) { $listener.Stop() }
+        $listener.Close()
+    } catch {}
+    Unregister-Event -SourceIdentifier PowerShell.Exiting -ErrorAction SilentlyContinue
+    Remove-ServerFirewallRule
 }
