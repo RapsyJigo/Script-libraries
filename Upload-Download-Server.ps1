@@ -1649,7 +1649,7 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
             Write-ServerLog "Save-UploadedFile: parsing multipart ($fileLen bytes on disk)" -Level Debug
 
             # Helper: read a small slice of the stream into a string (for headers only)
-            function Read-StreamSlice([System.IO.FileStream]$stream, [long]$start, [int]$length) {
+            function Read-StreamSlice([System.IO.FileStream]$stream, [long]$start, [long]$length) {
                 [byte[]]$slice = New-Object byte[] $length
                 $stream.Position = $start
                 $stream.Read($slice, 0, $length) | Out-Null
@@ -1662,7 +1662,7 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
                 [byte[]]$buf = New-Object byte[] 65536   # 64 KB copy buffer
                 $remaining = $length
                 while ($remaining -gt 0) {
-                    $toRead = [Math]::Min($buf.Length, $remaining)
+                    $toRead = [int][Math]::Min([int64]$buf.Length, $remaining)
                     $read = $src.Read($buf, 0, $toRead)
                     if ($read -eq 0) { break }
                     $dst.Write($buf, 0, $read)
