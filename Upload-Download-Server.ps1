@@ -46,7 +46,11 @@ param(
     [string] $UploadFileRegex = "",
 
     [Parameter(Mandatory = $false, HelpMessage = "Maximum upload size in bytes. 0 = unlimited.")]
-    [long] $MaxUploadSize = 0
+    [long] $MaxUploadSize = 0,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Comma-separated list of IP addresses allowed to upload. Empty = allow all.")]
+    [AllowEmptyString()]
+    [string] $UploadIPWhitelist = ""
 )
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -75,10 +79,11 @@ Write-ServerLog "Upload folder resolved: $resolvedUploadFolder" -Level Debug
 
 # Live settings (also seeded from parameters; /admin can update at runtime)
 $script:ServerSettings = @{
-    UploadFileRegex = $UploadFileRegex
-    Password        = $Password
-    UploadFolder    = $resolvedUploadFolder
-    MaxUploadSize   = $MaxUploadSize
+    UploadFileRegex   = $UploadFileRegex
+    Password          = $Password
+    UploadFolder      = $resolvedUploadFolder
+    MaxUploadSize     = $MaxUploadSize
+    UploadIPWhitelist = @($UploadIPWhitelist -split '\s*,\s*' | Where-Object { $_ -ne '' })
 }
 
 # ── Self-Elevation ───────────────────────────────────────────────────────────
@@ -87,7 +92,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-ServerLog "Not running as Administrator — relaunching elevated..." -Level Warn
     $url     = 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Upload-Download-Server.ps1'
     $escapedRegex = $UploadFileRegex -replace "'", "''"
-    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$resolvedUploadFolder' -Password '$Password' -UploadFileRegex '$escapedRegex' -MaxUploadSize $MaxUploadSize`""
+    $escapedWhitelist = $UploadIPWhitelist -replace "'", "''"
+    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$resolvedUploadFolder' -Password '$Password' -UploadFileRegex '$escapedRegex' -MaxUploadSize $MaxUploadSize -UploadIPWhitelist '$escapedWhitelist'`""
     Start-Process powershell -Verb RunAs -ArgumentList $argList
     exit
 }
@@ -181,6 +187,17 @@ function Test-UploadFileName([string]$fileName) {
         Ok      = $false
         Message = "File name does not match the required pattern. Rejected: $baseName"
     }
+}
+
+function Test-UploadIPAllowed([string]$ip) {
+    $whitelist = $script:ServerSettings.UploadIPWhitelist
+    if ($null -eq $whitelist -or $whitelist.Count -eq 0) { return $true }
+    # Normalise IPv4-mapped IPv6 (e.g. ::ffff:192.168.1.1 -> 192.168.1.1)
+    $normalized = $ip -replace '^::ffff:', ''
+    foreach ($entry in $whitelist) {
+        if ($entry.Trim() -eq $normalized) { return $true }
+    }
+    return $false
 }
 
 function Format-ByteSize([long]$bytes) {
@@ -518,10 +535,11 @@ function Send-FileStreamResponse(
 
 function Get-ServerSettingsObject {
     return @{
-        uploadFileRegex = $script:ServerSettings.UploadFileRegex
-        password        = $script:ServerSettings.Password
-        uploadFolder    = $script:ServerSettings.UploadFolder
-        maxUploadSize   = $script:ServerSettings.MaxUploadSize
+        uploadFileRegex   = $script:ServerSettings.UploadFileRegex
+        password          = $script:ServerSettings.Password
+        uploadFolder      = $script:ServerSettings.UploadFolder
+        maxUploadSize     = $script:ServerSettings.MaxUploadSize
+        uploadIPWhitelist = ($script:ServerSettings.UploadIPWhitelist -join ',')
     }
 }
 
@@ -595,6 +613,21 @@ function Set-ServerSettingsFromJson([string]$json, [ref]$errorMsg) {
         }
         $script:ServerSettings.MaxUploadSize = $size
         Write-ServerLog "Max upload size set to $(if ($size -gt 0) { Format-ByteSize $size } else { 'unlimited' })" -Level Info
+    }
+    if ($null -ne $data.PSObject.Properties['uploadIPWhitelist']) {
+        $raw = [string]$data.uploadIPWhitelist
+        $ips = @($raw -split '\s*,\s*' | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() })
+        # Validate each entry is a plausible IP address
+        foreach ($ip in $ips) {
+            $parsed = $null
+            if (-not [System.Net.IPAddress]::TryParse($ip, [ref]$parsed)) {
+                $errorMsg.Value = "Invalid IP address in whitelist: '$ip'. Use plain IPv4 or IPv6 addresses separated by commas."
+                return $false
+            }
+        }
+        $script:ServerSettings.UploadIPWhitelist = $ips
+        $countMsg = if ($ips.Count -eq 0) { 'disabled (all IPs allowed)' } else { "$($ips.Count) IP(s)" }
+        Write-ServerLog "Upload IP whitelist updated — $countMsg" -Level Info
     }
     Write-ServerLog "Settings applied — folder: $($script:ServerSettings.UploadFolder)" -Level Ok
     return $true
@@ -726,12 +759,31 @@ $CSS_SHARED = @'
 '@
 
 # ── Upload Page ──────────────────────────────────────────────────────────────
-function Get-UploadPage([string]$msg = "", [bool]$isError = $false) {
+function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlocked = $false, [string]$clientIP = "") {
     $msgHtml = ""
     if ($msg) {
         $cls = if ($isError) { "err" } else { "ok" }
         $msgHtml = "<div class='msg $cls'>$([System.Net.WebUtility]::HtmlEncode($msg))</div>"
     }
+
+    # ── IP-blocked banner (shown instead of the normal message area) ──────────
+    $blockedBannerHtml = ""
+    $blockedJs         = "false"
+    if ($ipBlocked) {
+        $safeIP = [System.Net.WebUtility]::HtmlEncode($clientIP)
+        $blockedBannerHtml = @"
+        <div class="ip-blocked-banner">
+          <span class="ip-blocked-icon">&#128683;</span>
+          <div>
+            <strong>Upload not allowed</strong><br>
+            Your IP address (<code>$safeIP</code>) is not on the upload whitelist.
+            Contact the server administrator to be added.
+          </div>
+        </div>
+"@
+        $blockedJs = "true"
+    }
+
     $regexHintHtml = ""
     if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) {
         $pat = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFileRegex)
@@ -918,6 +970,28 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false) {
     .filelist-panel { padding: 1.25rem; }
     .fi-size { display: none; }
   }
+  /* ── IP-blocked banner ── */
+  .ip-blocked-banner {
+    display: flex; align-items: flex-start; gap: .9rem;
+    margin-top: 1.2rem; padding: .9rem 1rem;
+    background: rgba(255,95,95,.08); border: 1px solid rgba(255,95,95,.4);
+    border-radius: var(--radius); font-size: .88rem; font-family: var(--mono);
+    color: var(--danger); line-height: 1.55;
+  }
+  .ip-blocked-banner strong { display: block; margin-bottom: .15rem; }
+  .ip-blocked-banner code {
+    font-family: var(--mono); font-size: .84rem;
+    background: rgba(255,95,95,.12); padding: .05rem .35rem; border-radius: 4px;
+  }
+  .ip-blocked-icon { font-size: 1.4rem; flex-shrink: 0; line-height: 1; margin-top: .05rem; }
+  /* Blocked state: dim the whole drop zone and disable pointer events */
+  .drop-zone.blocked {
+    opacity: .35; pointer-events: none; cursor: not-allowed;
+  }
+  /* Blocked button override — keeps the grayed style even if JS tries to enable */
+  #submitBtn.blocked {
+    opacity: .35 !important; cursor: not-allowed !important; pointer-events: none;
+  }
 </style></head>
 <body>
 <div class="topbar">
@@ -933,8 +1007,9 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false) {
       <h1>Upload</h1>
       <p class="sub">Drag &amp; drop or browse to select files</p>
 
+      $blockedBannerHtml
       <form id="uploadForm" enctype="multipart/form-data">
-        <div class="drop-zone" id="dropZone">
+        <div class="drop-zone$(if ($ipBlocked) { ' blocked' })" id="dropZone">
           <div class="drop-zone-icon">&#128228;</div>
           <div class="drop-zone-text">
             Drop files here<br>
@@ -970,7 +1045,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false) {
 
         $regexHintHtml
         $maxSizeHintHtml
-        <button type="submit" class="btn" id="submitBtn" disabled
+        <button type="submit" class="btn$(if ($ipBlocked) { ' blocked' })" id="submitBtn" disabled
                 style="opacity:.4;cursor:not-allowed">&#8593;&nbsp; Upload Files</button>
       </form>
       $msgHtml
@@ -990,17 +1065,18 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false) {
 <script>
 let allFiles = [];
 const MAX_UPLOAD_BYTES = $maxUploadJs;
+const IP_BLOCKED = $blockedJs;
 
 function escHtml(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';return (b/1048576).toFixed(1)+' MB';}
 
 // Drag & drop
 var dz = document.getElementById('dropZone');
-dz.addEventListener('dragover', function(e){ e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragover', function(e){ e.preventDefault(); if (!IP_BLOCKED) dz.classList.add('dragover'); });
 dz.addEventListener('dragleave', function(){ dz.classList.remove('dragover'); });
 dz.addEventListener('drop', function(e){
   e.preventDefault(); dz.classList.remove('dragover');
-  if (e.dataTransfer.files.length) { updatePreview(e.dataTransfer.files); }
+  if (!IP_BLOCKED && e.dataTransfer.files.length) { updatePreview(e.dataTransfer.files); }
 });
 document.getElementById('browseBtn').addEventListener('click', function(e){
   e.stopPropagation();
@@ -1027,7 +1103,9 @@ function updatePreview(files) {
       '<span class="fi-status" id="fi-st-' + i + '">queued</span>' +
     '</div>'
   ).join('');
-  btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer';
+  if (!IP_BLOCKED) {
+    btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer';
+  }
 }
 
 var saveProgressTimer = null;
@@ -1719,10 +1797,14 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     $maxMbVal = if ($script:ServerSettings.MaxUploadSize -gt 0) {
         [math]::Round($script:ServerSettings.MaxUploadSize / 1048576, 2).ToString([System.Globalization.CultureInfo]::InvariantCulture)
     } else { "0" }
-    $regexStatusBadge = if ([string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) { "Disabled" } else { "Active" }
+    $ipWhitelistVal = [System.Net.WebUtility]::HtmlEncode(($script:ServerSettings.UploadIPWhitelist -join ', '))
+    $regexStatusBadge    = if ([string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) { "Disabled" } else { "Active" }
     $passwordStatusBadge = if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) { "Unsecured" } else { "Protected" }
-    $folderStatusBadge = "Configured"
-    $maxSizeStatusBadge = if ($script:ServerSettings.MaxUploadSize -gt 0) { (Format-ByteSize $script:ServerSettings.MaxUploadSize) } else { "Unlimited" }
+    $folderStatusBadge   = "Configured"
+    $maxSizeStatusBadge  = if ($script:ServerSettings.MaxUploadSize -gt 0) { (Format-ByteSize $script:ServerSettings.MaxUploadSize) } else { "Unlimited" }
+    $ipWLCount           = $script:ServerSettings.UploadIPWhitelist.Count
+    $ipWLStatusBadge     = if ($ipWLCount -eq 0) { "Open" } else { "$ipWLCount IP(s)" }
+    $ipWLStatusWarn      = if ($ipWLCount -eq 0) { " warn" } else { "" }
     $msgHtml = ""
     if ($msg) {
         $cls = if ($isError) { "err" } else { "ok" }
@@ -1795,6 +1877,33 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
   }
   .regex-help-link:hover {
     background: rgba(0,221,255,.2); color: #fff; border-color: #fff;
+  }
+  /* ── IP tag list ── */
+  .ip-tag-input-wrap {
+    display: flex; flex-wrap: wrap; gap: .4rem; align-items: center;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: .5rem .7rem;
+    cursor: text; min-height: 2.6rem;
+    transition: border-color .2s;
+  }
+  .ip-tag-input-wrap:focus-within { border-color: var(--accent); }
+  .ip-tag {
+    display: inline-flex; align-items: center; gap: .3rem;
+    background: rgba(0,221,255,.12); border: 1px solid rgba(0,221,255,.3);
+    border-radius: 999px; padding: .18rem .55rem;
+    font-family: var(--mono); font-size: .78rem; color: var(--accent2);
+    white-space: nowrap;
+  }
+  .ip-tag-remove {
+    background: none; border: none; cursor: pointer; padding: 0;
+    color: var(--muted); font-size: .85rem; line-height: 1;
+    transition: color .15s;
+  }
+  .ip-tag-remove:hover { color: var(--danger); }
+  .ip-tag-text-input {
+    flex: 1; min-width: 9rem; background: transparent; border: none;
+    outline: none; color: var(--text); font-family: var(--mono); font-size: .9rem;
+    padding: .1rem .2rem;
   }
 </style></head>
 <body>
@@ -1887,6 +1996,30 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
       </div>
     </div>
 
+    <div class="setting-group">
+      <button class="setting-header" type="button" onclick="toggleSetting('set-ipwl')" aria-expanded="true">
+        <span class="setting-icon">&#128273;</span>
+        <span class="setting-title">Upload IP whitelist</span>
+        <span class="setting-status$ipWLStatusWarn" id="status-ipwl">$ipWLStatusBadge</span>
+        <span class="setting-chevron" id="chev-set-ipwl">&#9650;</span>
+      </button>
+      <div class="setting-body" id="set-ipwl">
+        <p class="setting-help">
+          When set, only the listed IP addresses may upload files. All other clients receive a&nbsp;<code>403 Forbidden</code>.
+          Leave empty to allow uploads from any IP. Supports both IPv4 (e.g. <code>192.168.1.50</code>) and IPv6.
+          Type an address and press <strong>Enter</strong>, <strong>Tab</strong>, <strong>Space</strong>, or <strong>comma</strong> to add it. Click the &times; on a tag to remove it.
+        </p>
+        <label>Allowed uploader IPs</label>
+        <div class="ip-tag-input-wrap" id="ipTagWrap" onclick="document.getElementById('ipRawInput').focus()">
+          <input type="text" id="ipRawInput" class="ip-tag-text-input"
+                 placeholder="e.g. 192.168.1.10" autocomplete="off" spellcheck="false"
+                 aria-label="Add IP address">
+        </div>
+        <!-- Hidden field holding the comma-joined value sent to the server -->
+        <input type="hidden" id="uploadIPWhitelist" name="uploadIPWhitelist" value="$ipWhitelistVal">
+      </div>
+    </div>
+
     <div class="apply-bar">
       <button type="button" class="btn" id="applyBtn">&#10003;&nbsp; Apply settings (live)</button>
     </div>
@@ -1939,6 +2072,12 @@ function updateStatusBadges(s) {
       maxEl.classList.remove('warn');
     }
   }
+  var ipEl = document.getElementById('status-ipwl');
+  if (ipEl) {
+    var wl = (s.uploadIPWhitelist || '').split(',').map(function(x){return x.trim();}).filter(Boolean);
+    if (wl.length === 0) { ipEl.textContent = 'Open'; ipEl.classList.add('warn'); }
+    else { ipEl.textContent = wl.length + ' IP(s)'; ipEl.classList.remove('warn'); }
+  }
 }
 
 function mbToBytes(mbStr) {
@@ -1953,6 +2092,70 @@ function bytesToMbStr(bytes) {
   return String(Math.round((b / 1048576) * 100) / 100);
 }
 
+// ── IP tag widget ─────────────────────────────────────────────────────────────
+(function() {
+  var wrap      = document.getElementById('ipTagWrap');
+  var rawInput  = document.getElementById('ipRawInput');
+  var hidden    = document.getElementById('uploadIPWhitelist');
+
+  function getTags() {
+    return hidden.value.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+  }
+
+  function renderTags() {
+    // Remove all existing tag elements (leave the text input)
+    Array.from(wrap.querySelectorAll('.ip-tag')).forEach(function(el){ el.remove(); });
+    getTags().forEach(function(ip) {
+      var tag = document.createElement('span');
+      tag.className = 'ip-tag';
+      tag.textContent = ip;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ip-tag-remove';
+      btn.innerHTML = '&times;';
+      btn.title = 'Remove ' + ip;
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var tags = getTags().filter(function(t){ return t !== ip; });
+        hidden.value = tags.join(',');
+        renderTags();
+      });
+      tag.appendChild(btn);
+      wrap.insertBefore(tag, rawInput);
+    });
+  }
+
+  function addIP(raw) {
+    var ip = raw.trim().replace(/,+$/, '');
+    if (!ip) return;
+    // Basic sanity: must look like an IP
+    if (!/^[\da-fA-F:.]+$/.test(ip)) { rawInput.style.color = 'var(--danger)'; return; }
+    rawInput.style.color = '';
+    var tags = getTags();
+    if (tags.indexOf(ip) === -1) { tags.push(ip); hidden.value = tags.join(','); }
+    rawInput.value = '';
+    renderTags();
+  }
+
+  rawInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === 'Tab' || e.key === ',' || e.key === ' ') {
+      if (rawInput.value.trim()) { e.preventDefault(); addIP(rawInput.value); }
+    } else if (e.key === 'Backspace' && rawInput.value === '') {
+      var tags = getTags();
+      if (tags.length > 0) { tags.pop(); hidden.value = tags.join(','); renderTags(); }
+    }
+  });
+  rawInput.addEventListener('blur', function() { if (rawInput.value.trim()) addIP(rawInput.value); });
+  rawInput.addEventListener('paste', function(e) {
+    e.preventDefault();
+    var text = (e.clipboardData || window.clipboardData).getData('text');
+    text.split(/[\s,]+/).forEach(function(part){ if (part.trim()) addIP(part); });
+  });
+
+  // Seed from the hidden field (populated server-side)
+  renderTags();
+})();
+
 document.getElementById('applyBtn').addEventListener('click', async function() {
   const btn = document.getElementById('applyBtn');
   btn.disabled = true;
@@ -1961,7 +2164,8 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
       uploadFileRegex: document.getElementById('uploadFileRegex').value,
       uploadFolder: document.getElementById('uploadFolder').value,
       password: document.getElementById('downloadPassword').value,
-      maxUploadSize: mbToBytes(document.getElementById('maxUploadSizeMb').value)
+      maxUploadSize: mbToBytes(document.getElementById('maxUploadSizeMb').value),
+      uploadIPWhitelist: document.getElementById('uploadIPWhitelist').value
     };
     const res = await fetch('/admin/settings', {
       method: 'POST',
@@ -1977,6 +2181,27 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
       document.getElementById('uploadFolder').value = data.settings.uploadFolder || '';
       document.getElementById('downloadPassword').value = data.settings.password || '';
       document.getElementById('maxUploadSizeMb').value = bytesToMbStr(data.settings.maxUploadSize);
+      document.getElementById('uploadIPWhitelist').value = data.settings.uploadIPWhitelist || '';
+      // Re-render the tag widget from the server-confirmed value
+      var wrap = document.getElementById('ipTagWrap');
+      Array.from(wrap.querySelectorAll('.ip-tag')).forEach(function(el){ el.remove(); });
+      var hidden = document.getElementById('uploadIPWhitelist');
+      var rawInput = document.getElementById('ipRawInput');
+      (hidden.value.split(',').map(function(s){return s.trim();}).filter(Boolean)).forEach(function(ip) {
+        var tag = document.createElement('span');
+        tag.className = 'ip-tag';
+        tag.textContent = ip;
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'ip-tag-remove'; btn.innerHTML = '&times;';
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          var tags = hidden.value.split(',').map(function(s){return s.trim();}).filter(function(t){return t!==ip;});
+          hidden.value = tags.join(',');
+          wrap.querySelectorAll('.ip-tag').forEach(function(el){ el.remove(); });
+        });
+        tag.appendChild(btn);
+        wrap.insertBefore(tag, rawInput);
+      });
       updateStatusBadges(data.settings);
     }
     showFlash('Settings applied — server is using the new configuration.', false);
@@ -1992,6 +2217,24 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
 }
 
 # ── Multipart Parser ─────────────────────────────────────────────────────────
+#
+# Performance design
+# ──────────────────
+# • Pending bytes are kept in a Queue[byte] (O(1) enqueue + dequeue) instead of
+#   a List[byte] whose RemoveAt(0) was O(n) on every byte.
+# • The raw InputStream is wrapped in a BufferedStream (256 KB) so .NET handles
+#   large kernel-to-user-space copy batches instead of per-read syscalls.
+# • Read-ParserBlock drains the pending queue with Array.Copy rather than a
+#   byte-by-byte loop.
+# • Read-ParserByte refills a small internal byte[] instead of calling
+#   ReadByte() (a virtual dispatch + boxing) for every header character.
+# • The boundary search uses Boyer-Moore-Horspool (BMH): bad-character skip
+#   table built once per upload, typical skip = boundary-length per mismatch,
+#   versus the old O(n*m) brute-force scan.
+# • Read-MultipartLine reuses a single pre-allocated byte[] line buffer and
+#   only allocates a string at return time.
+# • Stream-FileUntilDelimiter uses a 256 KB I/O buffer (was 64 KB).
+
 function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$senderIP = "unknown") {
     $contentType = $req.ContentType
     $bodyLen = $req.ContentLength64
@@ -2021,11 +2264,19 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
 
     [byte[]]$delimiterBytes = [System.Text.Encoding]::ASCII.GetBytes("`r`n--$boundary")
     $boundaryLine = "--$boundary"
-    $savedNames = [System.Collections.Generic.List[string]]::new()
-    $pending = [System.Collections.Generic.List[byte]]::new()
-    $bodyCounter = @{ Value = 0L }
+    $savedNames   = [System.Collections.Generic.List[string]]::new()
+    $bodyCounter  = @{ Value = 0L }
 
-    function Add-BodyBytes([int]$count) {
+    # ── Pending queue: O(1) Enqueue / Dequeue (replaces List[byte].RemoveAt(0))
+    $pending = [System.Collections.Generic.Queue[byte]]::new(512)
+
+    # ── Wrap the raw InputStream in a BufferedStream for large-block reads ────
+    $bufferedInput = [System.IO.BufferedStream]::new($req.InputStream, 262144)  # 256 KB buffer
+
+    # ── Single-byte refill buffer (avoids ReadByte() boxing overhead) ─────────
+    [byte[]]$oneByteBuf = New-Object byte[] 1
+
+    function Add-BodyBytes([long]$count) {
         if ($count -le 0) { return }
         $bodyCounter.Value += $count
         if ($limit -gt 0 -and $bodyCounter.Value -gt $limit) {
@@ -2034,25 +2285,28 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
     }
 
     function Read-ParserByte {
-        if ($pending.Count -gt 0) {
-            $b = $pending[0]
-            $pending.RemoveAt(0)
-            return [int]$b
-        }
-        $b = $req.InputStream.ReadByte()
-        if ($b -ge 0) { Add-BodyBytes 1 }
-        return $b
+        if ($pending.Count -gt 0) { return [int]($pending.Dequeue()) }
+        $n = $bufferedInput.Read($oneByteBuf, 0, 1)
+        if ($n -le 0) { return -1 }
+        Add-BodyBytes 1
+        return [int]$oneByteBuf[0]
     }
 
     function Read-ParserBlock([byte[]]$buffer, [int]$offset, [int]$count) {
         $copied = 0
-        while ($pending.Count -gt 0 -and $copied -lt $count) {
-            $buffer[$offset + $copied] = $pending[0]
-            $pending.RemoveAt(0)
-            $copied++
+        # Drain the pending queue using Array.Copy for the bulk portion
+        $pCount = $pending.Count
+        if ($pCount -gt 0) {
+            $take = [Math]::Min($pCount, $count)
+            # Queue.CopyTo copies in FIFO order into a temp array, then bulk-copy
+            [byte[]]$tmp = New-Object byte[] $take
+            $pending.CopyTo($tmp, 0)
+            [Array]::Copy($tmp, 0, $buffer, $offset, $take)
+            for ($i = 0; $i -lt $take; $i++) { [void]$pending.Dequeue() }
+            $copied = $take
         }
         if ($copied -lt $count) {
-            $read = $req.InputStream.Read($buffer, $offset + $copied, $count - $copied)
+            $read = $bufferedInput.Read($buffer, $offset + $copied, $count - $copied)
             if ($read -gt 0) {
                 Add-BodyBytes $read
                 $copied += $read
@@ -2061,25 +2315,29 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         return $copied
     }
 
+    # Reusable line buffer: avoids per-call List[byte] allocation
+    [byte[]]$lineBuf    = New-Object byte[] 65536
+    [int]   $lineBufLen = 0
+
     function Read-MultipartLine {
-        $line = [System.Collections.Generic.List[byte]]::new()
+        $lineBufLen = 0
         while ($true) {
             $b = Read-ParserByte
             if ($b -lt 0) {
-                if ($line.Count -eq 0) { return $null }
+                if ($lineBufLen -eq 0) { return $null }
                 break
             }
-            $line.Add([byte]$b)
-            if ($line.Count -gt 65536) {
+            if ($lineBufLen -ge $lineBuf.Length) {
                 throw [System.IO.IOException]::new("Multipart header line is too large.")
             }
+            $lineBuf[$lineBufLen++] = [byte]$b
             if ($b -eq 10) { break }
         }
-        return [System.Text.Encoding]::ASCII.GetString($line.ToArray())
+        return [System.Text.Encoding]::ASCII.GetString($lineBuf, 0, $lineBufLen)
     }
 
     function Read-MultipartHeaders {
-        $headers = New-Object System.Text.StringBuilder
+        $headers = [System.Text.StringBuilder]::new(512)
         while ($true) {
             $line = Read-MultipartLine
             if ($null -eq $line) { return $null }
@@ -2091,17 +2349,43 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         }
     }
 
+    # ── Boyer-Moore-Horspool bad-character skip table ─────────────────────────
+    # Typical skip per mismatch ≈ boundary length (~30-70 bytes) vs old O(1) advance.
+    [int[]]$bmhSkip = New-Object int[] 256
+    $patLen = $delimiterBytes.Length
+    for ($i = 0; $i -lt 256; $i++) { $bmhSkip[$i] = $patLen }
+    for ($i = 0; $i -lt ($patLen - 1); $i++) { $bmhSkip[$delimiterBytes[$i]] = $patLen - 1 - $i }
+
+    function Find-IndexOfBytesBMH([byte[]]$buffer, [int]$length, [int]$startIndex = 0) {
+        # Returns index of $delimiterBytes in $buffer[0..$length-1], or -1.
+        if ($length -lt $patLen) { return -1 }
+        $last = $length - $patLen
+        $i    = $startIndex
+        while ($i -le $last) {
+            # Compare last byte first (BMH heuristic)
+            $j = $patLen - 1
+            while ($j -ge 0 -and $buffer[$i + $j] -eq $delimiterBytes[$j]) { $j-- }
+            if ($j -lt 0) { return $i }
+            $skip = $bmhSkip[$buffer[$i + $patLen - 1]]
+            if ($skip -lt 1) { $skip = 1 }
+            $i += $skip
+        }
+        return -1
+    }
+
+    $ioBufSize = 262144  # 256 KB I/O buffer (was 64 KB)
+
     function Stream-FileUntilDelimiter([System.IO.Stream]$destStream) {
-        [byte[]]$buffer = New-Object byte[] (65536 + $delimiterBytes.Length)
-        $carry = 0
+        [byte[]]$buffer = New-Object byte[] ($ioBufSize + $patLen)
+        $carry     = 0
         $fileBytes = 0L
         while ($true) {
-            $read = Read-ParserBlock $buffer $carry 65536
+            $read = Read-ParserBlock $buffer $carry $ioBufSize
             if ($read -le 0) {
                 throw [System.IO.IOException]::new("Multipart delimiter was not found.")
             }
             $windowLen = $carry + $read
-            $idx = Find-IndexOfBytes -buffer $buffer -length $windowLen -needle $delimiterBytes -startIndex 0
+            $idx = Find-IndexOfBytesBMH $buffer $windowLen 0
             if ($idx -ge 0) {
                 if ($idx -gt 0 -and $null -ne $destStream) {
                     $destStream.Write($buffer, 0, $idx)
@@ -2110,14 +2394,14 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
                 if ($limit -gt 0 -and $fileBytes -gt $limit) {
                     throw [System.IO.IOException]::new("File exceeds maximum upload size ($(Format-ByteSize $limit)).")
                 }
-                $after = $idx + $delimiterBytes.Length
+                $after = $idx + $patLen
                 for ($i = $after; $i -lt $windowLen; $i++) {
-                    $pending.Add($buffer[$i])
+                    $pending.Enqueue($buffer[$i])
                 }
                 return $fileBytes
             }
 
-            $keep = [Math]::Min($delimiterBytes.Length - 1, $windowLen)
+            $keep     = [Math]::Min($patLen - 1, $windowLen)
             $writeLen = $windowLen - $keep
             if ($writeLen -gt 0 -and $null -ne $destStream) {
                 $destStream.Write($buffer, 0, $writeLen)
@@ -2168,7 +2452,15 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
 
                 $partDest = "$destPath.$([Guid]::NewGuid().ToString('N')).part"
                 try {
-                    $destStream = [System.IO.File]::OpenWrite($partDest)
+                    # Use FileOptions.SequentialScan to hint the OS for large sequential writes
+                    $destStream = [System.IO.FileStream]::new(
+                        $partDest,
+                        [System.IO.FileMode]::CreateNew,
+                        [System.IO.FileAccess]::Write,
+                        [System.IO.FileShare]::None,
+                        65536,
+                        [System.IO.FileOptions]::SequentialScan
+                    )
                     try {
                         $dataLen = Stream-FileUntilDelimiter $destStream
                     } finally { $destStream.Dispose() }
@@ -2191,6 +2483,8 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         }
     } catch [System.IO.IOException] {
         return @{ Names = @(); Error = $_.Exception.Message }
+    } finally {
+        $bufferedInput.Dispose()
     }
 
     Write-ServerLog "Save-UploadedFile: done — $($savedNames.Count) file(s) saved" -Level Ok
@@ -2358,27 +2652,40 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                    elseif ($ok -and $ok -ne "1") { "Uploaded: $([Uri]::UnescapeDataString($ok))" }
                    elseif ($ok) { "Files uploaded successfully!" } else { "" }
             $isErr = [bool]$err
-            Send-Response $ctx (Get-UploadPage -msg $msg -isError $isErr)
+            $visitorIP = $req.RemoteEndPoint.Address.ToString()
+            $blocked = -not (Test-UploadIPAllowed $visitorIP)
+            Send-Response $ctx (Get-UploadPage -msg $msg -isError $isErr -ipBlocked $blocked -clientIP $visitorIP)
         }
 
         # ── POST /upload ─────────────────────────────────────────────────────
         elseif ($path -eq "/upload" -and $method -eq "POST") {
-            Write-ServerLog "POST /upload (form) from $($req.RemoteEndPoint.Address)" -Level Info
-            $uploadResult = Save-UploadedFile $req $req.RemoteEndPoint.Address.ToString()
+            $uploaderIP = $req.RemoteEndPoint.Address.ToString()
+            Write-ServerLog "POST /upload (form) from $uploaderIP" -Level Info
+            if (-not (Test-UploadIPAllowed $uploaderIP)) {
+                Write-ServerLog "POST /upload blocked — IP $uploaderIP not in whitelist" -Level Warn
+                Send-Response $ctx (Get-UploadPage -msg "" -isError $false -ipBlocked $true -clientIP $uploaderIP) -status 403
+            } else {
+            $uploadResult = Save-UploadedFile $req $uploaderIP
             if ($uploadResult.Error) {
-                Send-Response $ctx (Get-UploadPage -msg $uploadResult.Error -isError $true) -status 400
+                Send-Response $ctx (Get-UploadPage -msg $uploadResult.Error -isError $true -ipBlocked $false -clientIP $uploaderIP) -status 400
             } elseif ($uploadResult.Names -and $uploadResult.Names.Count -gt 0) {
                 $enc = [Uri]::EscapeDataString(($uploadResult.Names -join ", "))
                 Send-Redirect $ctx "/?ok=$enc"
             } else {
-                Send-Response $ctx (Get-UploadPage -msg "Upload failed — no file received." -isError $true) -status 400
+                Send-Response $ctx (Get-UploadPage -msg "Upload failed — no file received." -isError $true -ipBlocked $false -clientIP $uploaderIP) -status 400
+            }
             }
         }
 
         # ── POST /upload-chunk (single file per XHR, used by progress uploader)
         elseif ($path -eq "/upload-chunk" -and $method -eq "POST") {
-            Write-ServerLog "POST /upload-chunk from $($req.RemoteEndPoint.Address)" -Level Info
-            $uploadResult = Save-UploadedFile $req $req.RemoteEndPoint.Address.ToString()
+            $uploaderIP = $req.RemoteEndPoint.Address.ToString()
+            Write-ServerLog "POST /upload-chunk from $uploaderIP" -Level Info
+            if (-not (Test-UploadIPAllowed $uploaderIP)) {
+                Write-ServerLog "POST /upload-chunk blocked — IP $uploaderIP not in whitelist" -Level Warn
+                Send-Response $ctx "Upload not allowed: your IP address is not whitelisted." -status 403 -contentType "text/plain; charset=utf-8"
+            } else {
+            $uploadResult = Save-UploadedFile $req $uploaderIP
             if ($uploadResult.Error) {
                 Write-ServerLog "/upload-chunk rejected: $($uploadResult.Error)" -Level Warn
                 Send-Response $ctx $uploadResult.Error -status 400 -contentType "text/plain; charset=utf-8"
@@ -2393,6 +2700,7 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             } else {
                 Write-ServerLog "/upload-chunk: no file in multipart body" -Level Warn
                 Send-Response $ctx "Upload failed — no file received." -status 400 -contentType "text/plain; charset=utf-8"
+            }
             }
         }
 
@@ -2560,6 +2868,7 @@ function New-RequestRunspacePool {
         'Test-IsLocalRequest',
         'Test-RegexPattern',
         'Test-UploadFileName',
+        'Test-UploadIPAllowed',
         'Format-ByteSize',
         'Get-SenderIpFromFileName',
         'Clear-UploadableFilesCache',
