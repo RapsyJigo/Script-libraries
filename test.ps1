@@ -615,6 +615,42 @@ function Get-OrBuildAllSendersZip($files) {
     }
 }
 
+function Get-SelectionZipCachePaths([string]$selectionHash) {
+    $cacheDir = Get-ZipCacheDir
+    @{
+        ZipPath      = Join-Path $cacheDir "selection-$selectionHash.zip"
+        ManifestPath = Join-Path $cacheDir "selection-$selectionHash.manifest.json"
+        DisplayName  = "selection-$selectionHash.zip"
+    }
+}
+
+function Get-OrBuildSelectionZip([string[]]$fileNames) {
+    # Resolve FileInfo objects for the requested names, preserving only existing files
+    $folder   = $script:ServerSettings.UploadFolder
+    $zipFiles = @($fileNames | ForEach-Object {
+        $safe = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString($_))
+        $fp   = Join-Path $folder $safe
+        if ($safe -and (Test-Path -LiteralPath $fp -PathType Leaf)) {
+            Get-Item -LiteralPath $fp
+        }
+    } | Where-Object { $null -ne $_ })
+
+    if ($zipFiles.Count -eq 0) { return $null }
+
+    $fingerprint = Get-ZipSourceFingerprint $zipFiles
+    $hash        = Get-ZipFingerprintHash $fingerprint
+    $paths       = Get-SelectionZipCachePaths $hash
+
+    if (-not (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
+        Write-ServerLog "Selection zip cache miss ($($zipFiles.Count) files, hash $hash) — rebuilding" -Level Info
+        Build-ZipCache $paths.ZipPath $zipFiles
+        Save-ZipCacheManifest $paths.ManifestPath $fingerprint
+    } else {
+        Write-ServerLog "Selection zip cache hit ($($zipFiles.Count) files) -> $($paths.ZipPath)" -Level Debug
+    }
+    return $paths
+}
+
 function Send-FileStreamResponse(
     [System.Net.HttpListenerContext]$ctx,
     [string]$filePath,
@@ -1681,7 +1717,7 @@ function Get-DownloadPage {
                 $enc      = [Uri]::EscapeDataString($_.Name)
                 $size     = if ($_.Length -lt 1024) { "$($_.Length) B" } elseif ($_.Length -lt 1048576) { "{0:N1} KB" -f ($_.Length/1KB) } elseif ($_.Length -lt 1073741824) { "{0:N1} MB" -f ($_.Length/1MB) } else { "{0:N1} GB" -f ($_.Length/1GB) }
                 $date     = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
-                "<tr data-enc='$enc'><td><a href='/download/file?name=$enc' class='dl-link dl-href' title='$rawName'>&#128196;&nbsp;$dispName</a></td><td>$size</td><td>$date</td><td><button class='copy-url-btn' data-name='$enc' onclick=`"copyUrl(this)`" title='Copy direct download link'>&#128279;<span class='url-label'> Copy URL</span></button></td></tr>"
+                "<tr data-enc='$enc' data-ip='$ip'><td><a href='/download/file?name=$enc' class='dl-link dl-href' title='$rawName'>&#128196;&nbsp;$dispName</a></td><td>$size</td><td>$date</td><td><button class='copy-url-btn' data-name='$enc' onclick=`"copyUrl(this)`" title='Copy direct download link'>&#128279;<span class='url-label'> Copy URL</span></button></td></tr>"
             }) -join "`n"
 
             @"
@@ -2050,6 +2086,36 @@ function zipAll(btn) {
       btn.textContent = '\u{1F4E6} Zip & Download';
     });
 }
+function zipSelection(btn) {
+  var files = btn.getAttribute('data-files').split(',').filter(Boolean);
+  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '?password=' + encodeURIComponent(DL_PASSWORD) : '';
+  btn.classList.add('busy');
+  btn.textContent = '\u23f3 Zipping\u2026';
+  fetch('/download/zip-selection' + pw, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(files)
+  })
+    .then(function(res) {
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      var cd = res.headers.get('Content-Disposition') || '';
+      var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
+      var filename = match ? decodeURIComponent(match[1].replace(/"/g, '')) : 'selection.zip';
+      return res.blob().then(function(blob) { return { blob: blob, filename: filename }; });
+    })
+    .then(function(r) {
+      var url = URL.createObjectURL(r.blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = r.filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+    })
+    .catch(function(err) { alert('Zip failed: ' + err.message); })
+    .finally(function() {
+      btn.classList.remove('busy');
+      btn.textContent = '\u{1F4E6} Zip & Download';
+    });
+}
 function sanitizeZipName(name) {
   return String(name || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown';
 }
@@ -2167,6 +2233,7 @@ function rebuildGroups(byRegex) {
     var rows = buckets[lbl];
     var safeId = 'rgrp-' + lbl.replace(/[^a-zA-Z0-9]/g, '_');
     var encList = rows.map(function(tr) { return '"' + tr.getAttribute('data-enc') + '"'; }).join(',');
+    var encListAttr = rows.map(function(tr) { return tr.getAttribute('data-enc'); }).join(',');
     var bodyRows = rows.map(function(tr) { return tr.outerHTML; }).join('');
     html +=
       '<div class="ip-group">' +
@@ -2178,6 +2245,7 @@ function rebuildGroups(byRegex) {
             '<span class="ip-chevron" id="chev-' + safeId + '">&#9650;</span>' +
           '</button>' +
           '<button class="dl-all-btn" onclick="downloadAll(this)" data-group="' + safeId + '" title="Download all files in this group">&#9196; Download All</button>' +
+          '<button class="zip-all-btn" onclick="zipSelection(this)" data-files="' + escHtml(encListAttr) + '" title="Zip and download all files in this group">&#128230; Zip &amp; Download</button>' +
         '</div>' +
         '<div class="ip-body" id="' + safeId + '" data-files="[' + encList + ']">' +
           '<table>' +
@@ -3504,6 +3572,32 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
+        # ── POST /download/zip-selection ─────────────────────────────────────
+        # Body: JSON array of URI-encoded filenames. Returns a cached zip of exactly those files.
+        elseif ($path -eq "/download/zip-selection" -and $method -eq "POST") {
+            $token     = Get-CookieToken $req
+            $quickpass = $req.QueryString["password"]
+            $authorized = [string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token) -or ($quickpass -eq $script:ServerSettings.Password)
+            if (-not $authorized) {
+                Send-Response $ctx '{"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $reader   = New-Object System.IO.StreamReader($req.InputStream, [System.Text.Encoding]::UTF8)
+                $body     = $reader.ReadToEnd()
+                $nameList = $null
+                try { $nameList = @($body | ConvertFrom-Json) } catch {}
+                if ($null -eq $nameList -or $nameList.Count -eq 0) {
+                    Send-Response $ctx "<h2>400 — No files specified</h2>" -status 400
+                } else {
+                    $paths = Get-OrBuildSelectionZip $nameList
+                    if ($null -eq $paths) {
+                        Send-Response $ctx "<h2>404 — No matching files found</h2>" -status 404
+                    } else {
+                        Send-FileStreamResponse $ctx $paths.ZipPath 'application/zip' $paths.DisplayName
+                    }
+                }
+            }
+        }
+
         # ── 404 ──────────────────────────────────────────────────────────────
         else {
             Write-ServerLog "404 Not Found: $method $path" -Level Warn
@@ -3548,6 +3642,8 @@ function New-RequestRunspacePool {
         'Get-AllSendersZipCachePaths',
         'Get-OrBuildSenderZip',
         'Get-OrBuildAllSendersZip',
+        'Get-SelectionZipCachePaths',
+        'Get-OrBuildSelectionZip',
         'Send-FileStreamResponse',
         'Send-BytesResponse',
         'Get-ServerSettingsObject',
