@@ -25,6 +25,14 @@
 .PARAMETER MaxUploadSize
   Maximum upload size in bytes. 0 = unlimited. Can also be changed live on /admin (localhost only).
 
+.PARAMETER UploadWindowStart
+  Optional upload window start (local time). ISO-8601 or "yyyy-MM-dd HH:mm". Empty = no start limit.
+  Can also be changed live on /admin (localhost only).
+
+.PARAMETER UploadWindowEnd
+  Optional upload window end (local time). ISO-8601 or "yyyy-MM-dd HH:mm". Empty = no end limit.
+  Can also be changed live on /admin (localhost only).
+
 .EXAMPLE
     .\FileServer.ps1
     .\FileServer.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
@@ -50,7 +58,15 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Comma-separated list of IP addresses allowed to upload. Empty = allow all.")]
     [AllowEmptyString()]
-    [string] $UploadIPWhitelist = ""
+    [string] $UploadIPWhitelist = "",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Upload window start (local). Empty = no start limit.")]
+    [AllowEmptyString()]
+    [string] $UploadWindowStart = "",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Upload window end (local). Empty = no end limit.")]
+    [AllowEmptyString()]
+    [string] $UploadWindowEnd = ""
 )
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -77,13 +93,100 @@ Write-ServerLog "Server is starting..." -Level Info
 $resolvedUploadFolder = (New-Item -ItemType Directory -Force -Path $UploadFolder).FullName
 Write-ServerLog "Upload folder resolved: $resolvedUploadFolder" -Level Debug
 
+function ConvertFrom-UploadWindowString([string]$text, [ref]$errorMsg) {
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $dt = $null
+    if ([datetime]::TryParse($text.Trim(), [ref]$dt)) { return $dt }
+    $formats = @('yyyy-MM-dd HH:mm', 'yyyy-MM-ddTHH:mm', 'yyyy/MM/dd HH:mm')
+    foreach ($fmt in $formats) {
+        if ([datetime]::TryParseExact($text.Trim(), $fmt, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) {
+            return $dt
+        }
+    }
+    $errorMsg.Value = "Invalid date/time: '$text' (use yyyy-MM-dd HH:mm)"
+    return $null
+}
+
+function ConvertFrom-UploadWindowPart($part, [ref]$errorMsg) {
+    if ($null -eq $part) { return $null }
+    $y = $part.year; $mo = $part.month; $d = $part.day; $h = $part.hour; $mi = $part.minute
+    if ($null -eq $y -and $null -eq $mo -and $null -eq $d -and $null -eq $h -and $null -eq $mi) { return $null }
+    try {
+        return Get-Date -Year ([int]$y) -Month ([int]$mo) -Day ([int]$d) -Hour ([int]$h) -Minute ([int]$mi) -Second 0
+    } catch {
+        $errorMsg.Value = "Invalid upload window date: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-UploadWindowPart([Nullable[datetime]]$dt) {
+    if ($null -eq $dt) { return $null }
+    return @{
+        year   = $dt.Year
+        month  = $dt.Month
+        day    = $dt.Day
+        hour   = $dt.Hour
+        minute = $dt.Minute
+    }
+}
+
+function Format-UploadWindowDisplay([Nullable[datetime]]$dt) {
+    if ($null -eq $dt) { return '' }
+    return $dt.ToString('yyyy-MM-dd HH:mm')
+}
+
+function ConvertTo-UnixTimeMs([Nullable[datetime]]$dt) {
+    if ($null -eq $dt) { return $null }
+    $local = $dt
+    if ($local.Kind -eq [DateTimeKind]::Unspecified) {
+        $local = [DateTime]::SpecifyKind($local, [DateTimeKind]::Local)
+    }
+    $epoch = New-Object datetime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)
+    return [int64](($local.ToUniversalTime() - $epoch).TotalMilliseconds)
+}
+
+function Get-UploadWindowState {
+    if (-not $script:ServerSettings.UploadWindowEnabled) { return 'disabled' }
+    $start = $script:ServerSettings.UploadWindowStart
+    $end   = $script:ServerSettings.UploadWindowEnd
+    if ($null -eq $start -and $null -eq $end) { return 'disabled' }
+    $now = Get-Date
+    if ($null -ne $start -and $now -lt $start) { return 'before' }
+    if ($null -ne $end -and $now -ge $end) { return 'after' }
+    return 'active'
+}
+
+function Test-UploadWindowOpen {
+    $state = Get-UploadWindowState
+    return ($state -eq 'disabled' -or $state -eq 'active')
+}
+
+$startupWindowErr = $null
+$parsedWindowStart = ConvertFrom-UploadWindowString $UploadWindowStart ([ref]$startupWindowErr)
+if ($startupWindowErr) {
+    Write-ServerLog "Invalid -UploadWindowStart: $startupWindowErr" -Level Error
+    exit 1
+}
+$parsedWindowEnd = ConvertFrom-UploadWindowString $UploadWindowEnd ([ref]$startupWindowErr)
+if ($startupWindowErr) {
+    Write-ServerLog "Invalid -UploadWindowEnd: $startupWindowErr" -Level Error
+    exit 1
+}
+if ($null -ne $parsedWindowStart -and $null -ne $parsedWindowEnd -and $parsedWindowEnd -le $parsedWindowStart) {
+    Write-ServerLog "Upload window end must be after start." -Level Error
+    exit 1
+}
+
 # Live settings (also seeded from parameters; /admin can update at runtime)
 $script:ServerSettings = @{
-    UploadFileRegex   = $UploadFileRegex
-    Password          = $Password
-    UploadFolder      = $resolvedUploadFolder
-    MaxUploadSize     = $MaxUploadSize
-    UploadIPWhitelist = @($UploadIPWhitelist -split '\s*,\s*' | Where-Object { $_ -ne '' })
+    UploadFileRegex      = $UploadFileRegex
+    Password             = $Password
+    UploadFolder         = $resolvedUploadFolder
+    MaxUploadSize        = $MaxUploadSize
+    UploadIPWhitelist    = @($UploadIPWhitelist -split '\s*,\s*' | Where-Object { $_ -ne '' })
+    UploadWindowEnabled  = ($null -ne $parsedWindowStart -or $null -ne $parsedWindowEnd)
+    UploadWindowStart    = $parsedWindowStart
+    UploadWindowEnd      = $parsedWindowEnd
 }
 
 # ── Self-Elevation ───────────────────────────────────────────────────────────
@@ -93,7 +196,9 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $url     = 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Upload-Download-Server.ps1'
     $escapedRegex = $UploadFileRegex -replace "'", "''"
     $escapedWhitelist = $UploadIPWhitelist -replace "'", "''"
-    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$resolvedUploadFolder' -Password '$Password' -UploadFileRegex '$escapedRegex' -MaxUploadSize $MaxUploadSize -UploadIPWhitelist '$escapedWhitelist'`""
+    $escapedWinStart = $UploadWindowStart -replace "'", "''"
+    $escapedWinEnd = $UploadWindowEnd -replace "'", "''"
+    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$resolvedUploadFolder' -Password '$Password' -UploadFileRegex '$escapedRegex' -MaxUploadSize $MaxUploadSize -UploadIPWhitelist '$escapedWhitelist' -UploadWindowStart '$escapedWinStart' -UploadWindowEnd '$escapedWinEnd'`""
     Start-Process powershell -Verb RunAs -ArgumentList $argList
     exit
 }
@@ -535,16 +640,19 @@ function Send-FileStreamResponse(
 
 function Get-ServerSettingsObject {
     return @{
-        uploadFileRegex   = $script:ServerSettings.UploadFileRegex
-        password          = $script:ServerSettings.Password
-        uploadFolder      = $script:ServerSettings.UploadFolder
-        maxUploadSize     = $script:ServerSettings.MaxUploadSize
-        uploadIPWhitelist = ($script:ServerSettings.UploadIPWhitelist -join ',')
+        uploadFileRegex      = $script:ServerSettings.UploadFileRegex
+        password             = $script:ServerSettings.Password
+        uploadFolder         = $script:ServerSettings.UploadFolder
+        maxUploadSize        = $script:ServerSettings.MaxUploadSize
+        uploadIPWhitelist    = ($script:ServerSettings.UploadIPWhitelist -join ',')
+        uploadWindowEnabled  = [bool]$script:ServerSettings.UploadWindowEnabled
+        uploadWindowStart    = Get-UploadWindowPart $script:ServerSettings.UploadWindowStart
+        uploadWindowEnd      = Get-UploadWindowPart $script:ServerSettings.UploadWindowEnd
     }
 }
 
 function Get-ServerSettingsJson {
-    return (Get-ServerSettingsObject | ConvertTo-Json -Compress)
+    return (Get-ServerSettingsObject | ConvertTo-Json -Compress -Depth 6)
 }
 
 if (-not [string]::IsNullOrWhiteSpace($UploadFileRegex)) {
@@ -628,6 +736,34 @@ function Set-ServerSettingsFromJson([string]$json, [ref]$errorMsg) {
         $script:ServerSettings.UploadIPWhitelist = $ips
         $countMsg = if ($ips.Count -eq 0) { 'disabled (all IPs allowed)' } else { "$($ips.Count) IP(s)" }
         Write-ServerLog "Upload IP whitelist updated — $countMsg" -Level Info
+    }
+    if ($null -ne $data.PSObject.Properties['uploadWindowEnabled']) {
+        $script:ServerSettings.UploadWindowEnabled = [bool]$data.uploadWindowEnabled
+    }
+    if ($null -ne $data.PSObject.Properties['uploadWindowStart']) {
+        $startDt = ConvertFrom-UploadWindowPart $data.uploadWindowStart ([ref]$errorMsg)
+        if ($errorMsg.Value) { return $false }
+        $script:ServerSettings.UploadWindowStart = $startDt
+    }
+    if ($null -ne $data.PSObject.Properties['uploadWindowEnd']) {
+        $endDt = ConvertFrom-UploadWindowPart $data.uploadWindowEnd ([ref]$errorMsg)
+        if ($errorMsg.Value) { return $false }
+        $script:ServerSettings.UploadWindowEnd = $endDt
+    }
+    if ($script:ServerSettings.UploadWindowEnabled) {
+        $ws = $script:ServerSettings.UploadWindowStart
+        $we = $script:ServerSettings.UploadWindowEnd
+        if ($null -eq $ws -and $null -eq $we) {
+            $errorMsg.Value = "Upload time window is enabled but neither start nor end is set."
+            return $false
+        }
+        if ($null -ne $ws -and $null -ne $we -and $we -le $ws) {
+            $errorMsg.Value = "Upload window end must be after the start time."
+            return $false
+        }
+        Write-ServerLog "Upload window: $(Format-UploadWindowDisplay $ws) → $(Format-UploadWindowDisplay $we)" -Level Info
+    } else {
+        Write-ServerLog "Upload time window disabled" -Level Info
     }
     Write-ServerLog "Settings applied — folder: $($script:ServerSettings.UploadFolder)" -Level Ok
     return $true
@@ -764,6 +900,28 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     if ($msg) {
         $cls = if ($isError) { "err" } else { "ok" }
         $msgHtml = "<div class='msg $cls'>$([System.Net.WebUtility]::HtmlEncode($msg))</div>"
+    }
+
+    $windowState = Get-UploadWindowState
+    $timeLocked = ($windowState -eq 'before' -or $windowState -eq 'after')
+    $winStart = $script:ServerSettings.UploadWindowStart
+    $winEnd = $script:ServerSettings.UploadWindowEnd
+    $winStartMs = if ($null -ne $winStart) { ConvertTo-UnixTimeMs $winStart } else { 'null' }
+    $winEndMs = if ($null -ne $winEnd) { ConvertTo-UnixTimeMs $winEnd } else { 'null' }
+    $winStartDisplay = [System.Net.WebUtility]::HtmlEncode((Format-UploadWindowDisplay $winStart))
+    $winEndDisplay = [System.Net.WebUtility]::HtmlEncode((Format-UploadWindowDisplay $winEnd))
+
+    $timeWindowBannerHtml = ""
+    if ($windowState -ne 'disabled') {
+        $timeWindowBannerHtml = @"
+        <div class="time-window-banner" id="timeWindowBanner">
+          <div class="time-window-head">
+            <span class="time-window-icon" id="timeWindowIcon">&#9200;</span>
+            <div class="time-window-text" id="timeWindowText"></div>
+          </div>
+          <div class="time-window-countdown" id="timeWindowCountdown"></div>
+        </div>
+"@
     }
 
     # ── IP-blocked banner (shown instead of the normal message area) ──────────
@@ -992,6 +1150,27 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   #submitBtn.blocked {
     opacity: .35 !important; cursor: not-allowed !important; pointer-events: none;
   }
+  .time-window-banner {
+    margin-top: 1.2rem; padding: .95rem 1rem;
+    background: rgba(0,221,255,.06); border: 1px solid rgba(0,221,255,.28);
+    border-radius: var(--radius); font-family: var(--mono); font-size: .86rem;
+    line-height: 1.55;
+  }
+  .time-window-banner.locked {
+    background: rgba(255,95,95,.08); border-color: rgba(255,95,95,.4);
+    color: var(--danger);
+  }
+  .time-window-banner.active-win {
+    background: rgba(106,240,200,.08); border-color: rgba(106,240,200,.35);
+  }
+  .time-window-head { display: flex; align-items: flex-start; gap: .75rem; }
+  .time-window-icon { font-size: 1.35rem; flex-shrink: 0; line-height: 1; }
+  .time-window-text strong { display: block; margin-bottom: .2rem; color: var(--text); }
+  .time-window-countdown {
+    margin-top: .65rem; font-size: 1.05rem; font-weight: 700;
+    color: var(--accent2); letter-spacing: .04em;
+  }
+  .time-window-banner.locked .time-window-countdown { color: var(--danger); }
 </style></head>
 <body>
 <div class="topbar">
@@ -1008,8 +1187,9 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
       <p class="sub">Drag &amp; drop or browse to select files</p>
 
       $blockedBannerHtml
+      $timeWindowBannerHtml
       <form id="uploadForm" enctype="multipart/form-data">
-        <div class="drop-zone$(if ($ipBlocked) { ' blocked' })" id="dropZone">
+        <div class="drop-zone$(if ($ipBlocked -or $timeLocked) { ' blocked' })" id="dropZone">
           <div class="drop-zone-icon">&#128228;</div>
           <div class="drop-zone-text">
             Drop files here<br>
@@ -1045,7 +1225,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
 
         $regexHintHtml
         $maxSizeHintHtml
-        <button type="submit" class="btn$(if ($ipBlocked) { ' blocked' })" id="submitBtn" disabled
+        <button type="submit" class="btn$(if ($ipBlocked -or $timeLocked) { ' blocked' })" id="submitBtn" disabled
                 style="opacity:.4;cursor:not-allowed">&#8593;&nbsp; Upload Files</button>
       </form>
       $msgHtml
@@ -1066,17 +1246,109 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
 let allFiles = [];
 const MAX_UPLOAD_BYTES = $maxUploadJs;
 const IP_BLOCKED = $blockedJs;
+const TIME_WINDOW = {
+  state: '$windowState',
+  startMs: $winStartMs,
+  endMs: $winEndMs,
+  startLabel: '$winStartDisplay',
+  endLabel: '$winEndDisplay'
+};
+const UPLOAD_LOCKED = IP_BLOCKED || TIME_WINDOW.state === 'before' || TIME_WINDOW.state === 'after';
 
 function escHtml(s){return s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';return (b/1048576).toFixed(1)+' MB';}
 
+function pad2(n){ return (n < 10 ? '0' : '') + n; }
+function formatCountdown(ms) {
+  if (ms <= 0) return '0:00:00';
+  var s = Math.floor(ms / 1000);
+  var d = Math.floor(s / 86400); s -= d * 86400;
+  var h = Math.floor(s / 3600); s -= h * 3600;
+  var m = Math.floor(s / 60); s -= m * 60;
+  var parts = [];
+  if (d > 0) parts.push(d + 'd');
+  parts.push(pad2(h) + ':' + pad2(m) + ':' + pad2(s));
+  return parts.join(' ');
+}
+
+function refreshTimeWindowUI() {
+  var banner = document.getElementById('timeWindowBanner');
+  if (!banner || TIME_WINDOW.state === 'disabled') return;
+  var textEl = document.getElementById('timeWindowText');
+  var cdEl = document.getElementById('timeWindowCountdown');
+  var now = Date.now();
+  var state = TIME_WINDOW.state;
+  if (TIME_WINDOW.startMs != null && now < TIME_WINDOW.startMs) state = 'before';
+  else if (TIME_WINDOW.endMs != null && now >= TIME_WINDOW.endMs) state = 'after';
+  else state = 'active';
+
+  banner.classList.remove('locked', 'active-win');
+  var targetMs = null;
+  var cdPrefix = '';
+
+  if (state === 'before') {
+    banner.classList.add('locked');
+    targetMs = TIME_WINDOW.startMs;
+    textEl.innerHTML = '<strong>Uploads not open yet</strong>Uploads open at <code>' + escHtml(TIME_WINDOW.startLabel) + '</code>.';
+    cdPrefix = 'Opens in ';
+  } else if (state === 'after') {
+    banner.classList.add('locked');
+    textEl.innerHTML = '<strong>Upload concluded</strong>Upload concluded at time: <code>' + escHtml(TIME_WINDOW.endLabel) + '</code>.';
+    cdEl.textContent = '';
+    lockUploadControls(true);
+    return;
+  } else {
+    banner.classList.add('active-win');
+    if (TIME_WINDOW.endMs != null) {
+      targetMs = TIME_WINDOW.endMs;
+      textEl.innerHTML = '<strong>Uploads open</strong>Upload window closes at <code>' + escHtml(TIME_WINDOW.endLabel) + '</code>.';
+      cdPrefix = 'Closes in ';
+    } else {
+      textEl.innerHTML = '<strong>Uploads open</strong>No scheduled close time.';
+      cdEl.textContent = '';
+      return;
+    }
+  }
+
+  if (targetMs == null) { cdEl.textContent = ''; return; }
+  var remaining = targetMs - now;
+  cdEl.textContent = cdPrefix + formatCountdown(remaining);
+  if (state === 'before') lockUploadControls(true);
+  else lockUploadControls(false);
+  if (remaining <= 0 && state === 'before') location.reload();
+  else if (remaining <= 0 && state === 'active' && TIME_WINDOW.endMs != null) location.reload();
+}
+
+function lockUploadControls(locked) {
+  var dz = document.getElementById('dropZone');
+  var btn = document.getElementById('submitBtn');
+  var browse = document.getElementById('browseBtn');
+  if (locked || IP_BLOCKED) {
+    if (dz) dz.classList.add('blocked');
+    if (btn) { btn.disabled = true; btn.classList.add('blocked'); btn.style.opacity = '.4'; btn.style.cursor = 'not-allowed'; }
+    if (browse) browse.style.pointerEvents = 'none';
+  } else if (!IP_BLOCKED) {
+    if (dz) dz.classList.remove('blocked');
+    if (btn) btn.classList.remove('blocked');
+    if (browse) browse.style.pointerEvents = '';
+    if (allFiles.length) {
+      btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer';
+    }
+  }
+}
+
+if (TIME_WINDOW.state !== 'disabled') {
+  refreshTimeWindowUI();
+  setInterval(refreshTimeWindowUI, 1000);
+}
+
 // Drag & drop
 var dz = document.getElementById('dropZone');
-dz.addEventListener('dragover', function(e){ e.preventDefault(); if (!IP_BLOCKED) dz.classList.add('dragover'); });
+dz.addEventListener('dragover', function(e){ e.preventDefault(); if (!UPLOAD_LOCKED) dz.classList.add('dragover'); });
 dz.addEventListener('dragleave', function(){ dz.classList.remove('dragover'); });
 dz.addEventListener('drop', function(e){
   e.preventDefault(); dz.classList.remove('dragover');
-  if (!IP_BLOCKED && e.dataTransfer.files.length) { updatePreview(e.dataTransfer.files); }
+  if (!UPLOAD_LOCKED && e.dataTransfer.files.length) { updatePreview(e.dataTransfer.files); }
 });
 document.getElementById('browseBtn').addEventListener('click', function(e){
   e.stopPropagation();
@@ -1103,7 +1375,7 @@ function updatePreview(files) {
       '<span class="fi-status" id="fi-st-' + i + '">queued</span>' +
     '</div>'
   ).join('');
-  if (!IP_BLOCKED) {
+  if (!UPLOAD_LOCKED) {
     btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer';
   }
 }
@@ -1256,7 +1528,7 @@ function uploadOneFile(fileIndex, fileTotal, onUploadBytesSent) {
 
 document.getElementById('uploadForm').addEventListener('submit', async function(e) {
   e.preventDefault();
-  if (!allFiles.length) return;
+  if (!allFiles.length || UPLOAD_LOCKED) return;
 
   const submitBtn  = document.getElementById('submitBtn');
   const browseBtn  = document.getElementById('browseBtn');
@@ -1805,6 +2077,25 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     $ipWLCount           = $script:ServerSettings.UploadIPWhitelist.Count
     $ipWLStatusBadge     = if ($ipWLCount -eq 0) { "Open" } else { "$ipWLCount IP(s)" }
     $ipWLStatusWarn      = if ($ipWLCount -eq 0) { " warn" } else { "" }
+    $winEnabled          = [bool]$script:ServerSettings.UploadWindowEnabled
+    $winStartPart        = Get-UploadWindowPart $script:ServerSettings.UploadWindowStart
+    $winEndPart          = Get-UploadWindowPart $script:ServerSettings.UploadWindowEnd
+    $winStartY  = if ($null -ne $winStartPart) { [string]$winStartPart.year } else { '' }
+    $winStartMo = if ($null -ne $winStartPart) { [string]$winStartPart.month } else { '' }
+    $winStartD  = if ($null -ne $winStartPart) { [string]$winStartPart.day } else { '' }
+    $winStartH  = if ($null -ne $winStartPart) { [string]$winStartPart.hour } else { '' }
+    $winStartMi = if ($null -ne $winStartPart) { [string]$winStartPart.minute } else { '' }
+    $winEndY  = if ($null -ne $winEndPart) { [string]$winEndPart.year } else { '' }
+    $winEndMo = if ($null -ne $winEndPart) { [string]$winEndPart.month } else { '' }
+    $winEndD  = if ($null -ne $winEndPart) { [string]$winEndPart.day } else { '' }
+    $winEndH  = if ($null -ne $winEndPart) { [string]$winEndPart.hour } else { '' }
+    $winEndMi = if ($null -ne $winEndPart) { [string]$winEndPart.minute } else { '' }
+    $winStatusBadge = if (-not $winEnabled) { "Off" }
+        elseif ($null -ne $script:ServerSettings.UploadWindowStart -and $null -ne $script:ServerSettings.UploadWindowEnd) {
+            "$(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowStart) – $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowEnd)"
+        }
+        elseif ($null -ne $script:ServerSettings.UploadWindowStart) { "From $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowStart)" }
+        else { "Until $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowEnd)" }
     $msgHtml = ""
     if ($msg) {
         $cls = if ($isError) { "err" } else { "ok" }
@@ -1904,6 +2195,71 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     flex: 1; min-width: 9rem; background: transparent; border: none;
     outline: none; color: var(--text); font-family: var(--mono); font-size: .9rem;
     padding: .1rem .2rem;
+  }
+  .dt-grid {
+    display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: .5rem; margin-top: .35rem;
+  }
+  .dt-grid label { font-size: .7rem; margin: 0; color: var(--muted); }
+  .dt-grid input {
+    width: 100%; margin-top: .2rem; padding: .45rem .5rem;
+    font-family: var(--mono); font-size: .85rem;
+  }
+  .dt-section { margin-top: 1.1rem; }
+  .dt-section-title {
+    font-family: var(--mono); font-size: .78rem; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--accent2);
+    margin-bottom: .35rem;
+  }
+  .window-enable-row {
+    display: flex; align-items: center; gap: 1rem;
+    margin-top: 1.1rem; padding: .85rem 1rem;
+    background: rgba(0,221,255,.04); border: 1px solid rgba(0,221,255,.18);
+    border-radius: var(--radius);
+  }
+  .window-enable-row input[type=checkbox] { display: none; }
+  .toggle-track {
+    position: relative; flex-shrink: 0;
+    width: 2.8rem; height: 1.5rem;
+    background: var(--border); border-radius: 999px;
+    cursor: pointer; transition: background .2s;
+    border: 1.5px solid rgba(255,255,255,.08);
+  }
+  .toggle-track::after {
+    content: ''; position: absolute;
+    top: 50%; left: .2rem; transform: translateY(-50%);
+    width: 1rem; height: 1rem; border-radius: 50%;
+    background: var(--muted); transition: left .2s, background .2s;
+  }
+  #uploadWindowEnabled:checked ~ .window-enable-row .toggle-track,
+  .toggle-track.on {
+    background: var(--accent2); border-color: var(--accent2);
+  }
+  #uploadWindowEnabled:checked ~ .window-enable-row .toggle-track::after,
+  .toggle-track.on::after {
+    left: calc(100% - 1.2rem); background: #0d0d0f;
+  }
+  .window-enable-label {
+    font-family: var(--mono); font-size: .9rem; font-weight: 700;
+    color: var(--text); cursor: pointer; user-select: none;
+    flex: 1;
+  }
+  .window-enable-label .sublabel {
+    display: block; font-size: .75rem; font-weight: 400; color: var(--muted); margin-top: .15rem;
+  }
+  .window-enable-state {
+    font-family: var(--mono); font-size: .72rem; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase;
+    padding: .2rem .6rem; border-radius: 999px; flex-shrink: 0;
+    background: rgba(160,160,184,.1); color: var(--muted);
+    border: 1px solid rgba(160,160,184,.2); transition: all .2s;
+  }
+  .window-enable-state.active {
+    background: rgba(0,221,255,.12); color: var(--accent2);
+    border-color: rgba(0,221,255,.3);
+  }
+  @media (max-width: 640px) {
+    .dt-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   }
 </style></head>
 <body>
@@ -2020,6 +2376,64 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
       </div>
     </div>
 
+    <div class="setting-group">
+      <button class="setting-header" type="button" onclick="toggleSetting('set-timewin')" aria-expanded="true">
+        <span class="setting-icon">&#9200;</span>
+        <span class="setting-title">Upload time window</span>
+        <span class="setting-status$(if (-not $winEnabled) { ' warn' })" id="status-timewin">$([System.Net.WebUtility]::HtmlEncode($winStatusBadge))</span>
+        <span class="setting-chevron" id="chev-set-timewin">&#9650;</span>
+      </button>
+      <div class="setting-body" id="set-timewin">
+        <p class="setting-help">
+          Restrict when the public upload page accepts files. Before the start time, uploads are locked and a countdown is shown.
+          During the window, a countdown to close is shown. After the end time, uploads are locked and visitors see when uploads concluded.
+          Times use this machine's local timezone.
+        </p>
+        <input type="checkbox" id="uploadWindowEnabled"$(if ($winEnabled) { ' checked' })>
+        <div class="window-enable-row" id="windowEnableRow" onclick="toggleWindowEnabled()">
+          <span class="toggle-track" id="toggleTrack"></span>
+          <span class="window-enable-label">
+            Enable upload time window
+            <span class="sublabel">Lock or schedule when the upload page accepts files</span>
+          </span>
+          <span class="window-enable-state" id="windowEnableState">Off</span>
+        </div>
+        <script>
+        (function(){
+          var cb = document.getElementById('uploadWindowEnabled');
+          var track = document.getElementById('toggleTrack');
+          var state = document.getElementById('windowEnableState');
+          function sync() {
+            if (cb.checked) { track.classList.add('on'); state.textContent = 'On'; state.classList.add('active'); }
+            else            { track.classList.remove('on'); state.textContent = 'Off'; state.classList.remove('active'); }
+          }
+          window.toggleWindowEnabled = function() { cb.checked = !cb.checked; sync(); };
+          sync();
+        })();
+        </script>
+        <div class="dt-section">
+          <div class="dt-section-title">Window opens</div>
+          <div class="dt-grid">
+            <div><label for="winStartYear">Year</label><input type="number" id="winStartYear" min="1970" max="2100" placeholder="2026" value="$winStartY"></div>
+            <div><label for="winStartMonth">Month</label><input type="number" id="winStartMonth" min="1" max="12" placeholder="6" value="$winStartMo"></div>
+            <div><label for="winStartDay">Day</label><input type="number" id="winStartDay" min="1" max="31" placeholder="4" value="$winStartD"></div>
+            <div><label for="winStartHour">Hour</label><input type="number" id="winStartHour" min="0" max="23" placeholder="9" value="$winStartH"></div>
+            <div><label for="winStartMinute">Minute</label><input type="number" id="winStartMinute" min="0" max="59" placeholder="0" value="$winStartMi"></div>
+          </div>
+        </div>
+        <div class="dt-section">
+          <div class="dt-section-title">Window closes</div>
+          <div class="dt-grid">
+            <div><label for="winEndYear">Year</label><input type="number" id="winEndYear" min="1970" max="2100" placeholder="2026" value="$winEndY"></div>
+            <div><label for="winEndMonth">Month</label><input type="number" id="winEndMonth" min="1" max="12" placeholder="6" value="$winEndMo"></div>
+            <div><label for="winEndDay">Day</label><input type="number" id="winEndDay" min="1" max="31" placeholder="4" value="$winEndD"></div>
+            <div><label for="winEndHour">Hour</label><input type="number" id="winEndHour" min="0" max="23" placeholder="17" value="$winEndH"></div>
+            <div><label for="winEndMinute">Minute</label><input type="number" id="winEndMinute" min="0" max="59" placeholder="0" value="$winEndMi"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="apply-bar">
       <button type="button" class="btn" id="applyBtn">&#10003;&nbsp; Apply settings (live)</button>
     </div>
@@ -2077,6 +2491,46 @@ function updateStatusBadges(s) {
     var wl = (s.uploadIPWhitelist || '').split(',').map(function(x){return x.trim();}).filter(Boolean);
     if (wl.length === 0) { ipEl.textContent = 'Open'; ipEl.classList.add('warn'); }
     else { ipEl.textContent = wl.length + ' IP(s)'; ipEl.classList.remove('warn'); }
+  }
+  var twEl = document.getElementById('status-timewin');
+  if (twEl) {
+    if (!s.uploadWindowEnabled) { twEl.textContent = 'Off'; twEl.classList.add('warn'); }
+    else {
+      twEl.classList.remove('warn');
+      var a = formatWindowPart(s.uploadWindowStart);
+      var b = formatWindowPart(s.uploadWindowEnd);
+      if (a && b) twEl.textContent = a + ' – ' + b;
+      else if (a) twEl.textContent = 'From ' + a;
+      else if (b) twEl.textContent = 'Until ' + b;
+      else twEl.textContent = 'Enabled (no times)';
+    }
+  }
+}
+
+function formatWindowPart(p) {
+  if (!p || p.year == null) return '';
+  return padDt(p.year) + '-' + padDt(p.month) + '-' + padDt(p.day) + ' ' + padDt(p.hour) + ':' + padDt(p.minute);
+}
+function padDt(n) { n = parseInt(n, 10); return (n < 10 ? '0' : '') + n; }
+
+function readWindowPart(prefix) {
+  var y = document.getElementById(prefix + 'Year').value.trim();
+  if (!y) return null;
+  return {
+    year: parseInt(y, 10),
+    month: parseInt(document.getElementById(prefix + 'Month').value, 10),
+    day: parseInt(document.getElementById(prefix + 'Day').value, 10),
+    hour: parseInt(document.getElementById(prefix + 'Hour').value, 10) || 0,
+    minute: parseInt(document.getElementById(prefix + 'Minute').value, 10) || 0
+  };
+}
+
+function fillWindowFields(prefix, part) {
+  var ids = ['Year','Month','Day','Hour','Minute'];
+  var keys = ['year','month','day','hour','minute'];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(prefix + ids[i]);
+    if (el) el.value = (part && part[keys[i]] != null) ? String(part[keys[i]]) : '';
   }
 }
 
@@ -2165,7 +2619,10 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
       uploadFolder: document.getElementById('uploadFolder').value,
       password: document.getElementById('downloadPassword').value,
       maxUploadSize: mbToBytes(document.getElementById('maxUploadSizeMb').value),
-      uploadIPWhitelist: document.getElementById('uploadIPWhitelist').value
+      uploadIPWhitelist: document.getElementById('uploadIPWhitelist').value,
+      uploadWindowEnabled: document.getElementById('uploadWindowEnabled').checked,
+      uploadWindowStart: readWindowPart('winStart'),
+      uploadWindowEnd: readWindowPart('winEnd')
     };
     const res = await fetch('/admin/settings', {
       method: 'POST',
@@ -2182,6 +2639,9 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
       document.getElementById('downloadPassword').value = data.settings.password || '';
       document.getElementById('maxUploadSizeMb').value = bytesToMbStr(data.settings.maxUploadSize);
       document.getElementById('uploadIPWhitelist').value = data.settings.uploadIPWhitelist || '';
+      document.getElementById('uploadWindowEnabled').checked = !!data.settings.uploadWindowEnabled;
+      fillWindowFields('winStart', typeof data.settings.uploadWindowStart === 'string' ? JSON.parse(data.settings.uploadWindowStart) : data.settings.uploadWindowStart);
+      fillWindowFields('winEnd',   typeof data.settings.uploadWindowEnd   === 'string' ? JSON.parse(data.settings.uploadWindowEnd)   : data.settings.uploadWindowEnd);
       // Re-render the tag widget from the server-confirmed value
       var wrap = document.getElementById('ipTagWrap');
       Array.from(wrap.querySelectorAll('.ip-tag')).forEach(function(el){ el.remove(); });
@@ -2236,6 +2696,16 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
 # • Stream-FileUntilDelimiter uses a 256 KB I/O buffer (was 64 KB).
 
 function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$senderIP = "unknown") {
+    if (-not (Test-UploadWindowOpen)) {
+        $winState = Get-UploadWindowState
+        if ($winState -eq 'before') {
+            $openAt = Format-UploadWindowDisplay $script:ServerSettings.UploadWindowStart
+            return @{ Error = "Uploads are not open yet. They open at $openAt." }
+        }
+        $endedAt = Format-UploadWindowDisplay $script:ServerSettings.UploadWindowEnd
+        return @{ Error = "Upload concluded at time: $endedAt" }
+    }
+
     $contentType = $req.ContentType
     $bodyLen = $req.ContentLength64
     Write-ServerLog "Save-UploadedFile: begin from $senderIP (Content-Type: $contentType, Content-Length: $bodyLen)" -Level Info
@@ -2591,6 +3061,11 @@ if ($script:ServerSettings.MaxUploadSize -gt 0) {
 } else {
   Write-Host "  Max Upload    : Unlimited" -ForegroundColor DarkCyan
 }
+if ($script:ServerSettings.UploadWindowEnabled) {
+  $ws = Format-UploadWindowDisplay $script:ServerSettings.UploadWindowStart
+  $we = Format-UploadWindowDisplay $script:ServerSettings.UploadWindowEnd
+  Write-Host "  Upload Window : $(if ($ws) { $ws } else { '(no start)' }) → $(if ($we) { $we } else { '(no end)' })" -ForegroundColor DarkCyan
+}
 if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) {
   Write-Host "  Password      : Unsecure mode, no password needed" -ForegroundColor Red
 }
@@ -2661,7 +3136,14 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
         elseif ($path -eq "/upload" -and $method -eq "POST") {
             $uploaderIP = $req.RemoteEndPoint.Address.ToString()
             Write-ServerLog "POST /upload (form) from $uploaderIP" -Level Info
-            if (-not (Test-UploadIPAllowed $uploaderIP)) {
+            if (-not (Test-UploadWindowOpen)) {
+                $winMsg = if ((Get-UploadWindowState) -eq 'before') {
+                    "Uploads are not open yet. They open at $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowStart)."
+                } else {
+                    "Upload concluded at time: $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowEnd)"
+                }
+                Send-Response $ctx (Get-UploadPage -msg $winMsg -isError $true -ipBlocked $false -clientIP $uploaderIP) -status 403
+            } elseif (-not (Test-UploadIPAllowed $uploaderIP)) {
                 Write-ServerLog "POST /upload blocked — IP $uploaderIP not in whitelist" -Level Warn
                 Send-Response $ctx (Get-UploadPage -msg "" -isError $false -ipBlocked $true -clientIP $uploaderIP) -status 403
             } else {
@@ -2681,7 +3163,15 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
         elseif ($path -eq "/upload-chunk" -and $method -eq "POST") {
             $uploaderIP = $req.RemoteEndPoint.Address.ToString()
             Write-ServerLog "POST /upload-chunk from $uploaderIP" -Level Info
-            if (-not (Test-UploadIPAllowed $uploaderIP)) {
+            if (-not (Test-UploadWindowOpen)) {
+                $winMsg = if ((Get-UploadWindowState) -eq 'before') {
+                    "Uploads are not open yet. They open at $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowStart)."
+                } else {
+                    "Upload concluded at time: $(Format-UploadWindowDisplay $script:ServerSettings.UploadWindowEnd)"
+                }
+                Write-ServerLog "POST /upload-chunk blocked — outside upload window" -Level Warn
+                Send-Response $ctx $winMsg -status 403 -contentType "text/plain; charset=utf-8"
+            } elseif (-not (Test-UploadIPAllowed $uploaderIP)) {
                 Write-ServerLog "POST /upload-chunk blocked — IP $uploaderIP not in whitelist" -Level Warn
                 Send-Response $ctx "Upload not allowed: your IP address is not whitelisted." -status 403 -contentType "text/plain; charset=utf-8"
             } else {
@@ -2733,10 +3223,24 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                 $body   = $reader.ReadToEnd()
                 $setErr = $null
                 if (Set-ServerSettingsFromJson $body ([ref]$setErr)) {
-                    $payload = (@{ ok = $true; settings = (Get-ServerSettingsObject) } | ConvertTo-Json -Compress -Depth 4)
+                    $s = Get-ServerSettingsObject
+                    $winStartJson = if ($null -ne $s.uploadWindowStart) { $s.uploadWindowStart | ConvertTo-Json -Compress } else { 'null' }
+                    $winEndJson   = if ($null -ne $s.uploadWindowEnd)   { $s.uploadWindowEnd   | ConvertTo-Json -Compress } else { 'null' }
+                    $innerJson = (@{
+                        uploadFileRegex     = $s.uploadFileRegex
+                        password            = $s.password
+                        uploadFolder        = $s.uploadFolder
+                        maxUploadSize       = $s.maxUploadSize
+                        uploadIPWhitelist   = $s.uploadIPWhitelist
+                        uploadWindowEnabled = $s.uploadWindowEnabled
+                    } | ConvertTo-Json -Compress -Depth 2)
+                    $innerJson = $innerJson.TrimEnd('}') + ',' +
+                        '"uploadWindowStart":' + $winStartJson + ',' +
+                        '"uploadWindowEnd":' + $winEndJson + '}'
+                    $payload = '{"ok":true,"settings":' + $innerJson + '}'
                     Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
                 } else {
-                    $payload = (@{ ok = $false; error = $setErr } | ConvertTo-Json -Compress -Depth 4)
+                    $payload = (@{ ok = $false; error = $setErr } | ConvertTo-Json -Compress -Depth 2)
                     Send-Response $ctx $payload -status 400 -contentType "application/json; charset=utf-8"
                 }
             }
@@ -2893,6 +3397,13 @@ function New-RequestRunspacePool {
         'Get-ServerSettingsObject',
         'Get-ServerSettingsJson',
         'Set-ServerSettingsFromJson',
+        'ConvertFrom-UploadWindowString',
+        'ConvertFrom-UploadWindowPart',
+        'Get-UploadWindowPart',
+        'Format-UploadWindowDisplay',
+        'ConvertTo-UnixTimeMs',
+        'Get-UploadWindowState',
+        'Test-UploadWindowOpen',
         'Get-UploadPage',
         'Get-LoginPage',
         'Get-DownloadPage',
