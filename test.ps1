@@ -1710,7 +1710,7 @@ function Get-DownloadPage {
             $ip       = [System.Net.WebUtility]::HtmlEncode($_.Name)
             $groupId  = "grp-" + ($ip -replace '[^a-zA-Z0-9]', '_')
             $count    = $_.Group.Count
-            $encListJson = ($_.Group | ForEach-Object { '&quot;' + [Uri]::EscapeDataString($_.Name) + '&quot;' }) -join ','
+            $encListSpace = ($_.Group | ForEach-Object { [Uri]::EscapeDataString($_.Name) }) -join ' '
             $rowsHtml = ($_.Group | ForEach-Object {
                 $dispName = [System.Net.WebUtility]::HtmlEncode((Get-DisplayName $_.Name))
                 $rawName  = [System.Net.WebUtility]::HtmlEncode($_.Name)
@@ -1730,9 +1730,9 @@ function Get-DownloadPage {
       <span class="ip-chevron" id="chev-$groupId">&#9650;</span>
     </button>
     <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files from this sender">&#9196; Download All</button>
-    <button class="zip-all-btn" onclick="zipAll(this)" data-ip="$ip" title="Zip and download all files from this sender">&#128230; Zip &amp; Download</button>
+    <button class="zip-all-btn" onclick="zipSelection(this)" data-group="$groupId" title="Zip and download all files from this sender">&#128230; Zip &amp; Download</button>
   </div>
-  <div class="ip-body" id="$groupId" data-files="[$encListJson]" data-ip="$ip">
+  <div class="ip-body" id="$groupId" data-filelist="$encListSpace" data-ip="$ip">
     <table>
       <colgroup><col class="col-file"><col class="col-size"><col class="col-date"><col class="col-action"></colgroup>
       <thead><tr><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
@@ -2033,7 +2033,7 @@ function labelHtml(wide, short) {
 function downloadAll(btn) {
   var groupId = btn.getAttribute('data-group');
   var body = document.getElementById(groupId);
-  var files = JSON.parse(body.getAttribute('data-files'));
+  var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
   btn.textContent = '\u23f3 Downloading\u2026';
@@ -2057,37 +2057,10 @@ function downloadAll(btn) {
   }
   next();
 }
-function zipAll(btn) {
-  var ip = btn.getAttribute('data-ip');
-  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
-  btn.classList.add('busy');
-  btn.textContent = '\u23f3 Zipping\u2026';
-  fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw)
-    .then(function(res) {
-      if (!res.ok) throw new Error('Server returned ' + res.status);
-      var cd = res.headers.get('Content-Disposition') || '';
-      var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
-      var filename = match ? decodeURIComponent(match[1].replace(/"/g, '')) : 'files.zip';
-      return res.blob().then(function(blob) { return { blob: blob, filename: filename }; });
-    })
-    .then(function(r) {
-      var url = URL.createObjectURL(r.blob);
-      var a = document.createElement('a');
-      a.href = url;
-      a.download = r.filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
-    })
-    .catch(function(err) { alert('Zip failed: ' + err.message); })
-    .finally(function() {
-      btn.classList.remove('busy');
-      btn.textContent = '\u{1F4E6} Zip & Download';
-    });
-}
 function zipSelection(btn) {
-  var files = btn.getAttribute('data-files').split(',').filter(Boolean);
+  var groupId = btn.getAttribute('data-group');
+  var body = document.getElementById(groupId);
+  var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '?password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
   btn.textContent = '\u23f3 Zipping\u2026';
@@ -2126,7 +2099,9 @@ function filenameFromDisposition(header, fallback) {
 }
 async function downloadEverything(btn) {
   if (!SENDER_IPS.length) return;
-  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
+  var pw       = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
+  var pwQuery  = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '?password=' + encodeURIComponent(DL_PASSWORD) : '';
+  var byRegex  = REGEX_ACTIVE && document.getElementById('groupbyCheck') && document.getElementById('groupbyCheck').checked;
 
   btn.disabled = true;
   document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.add('busy'); });
@@ -2136,59 +2111,103 @@ async function downloadEverything(btn) {
   var progressFill  = document.getElementById('zipProgressFill');
   progressBar.classList.add('visible');
 
-  function safeId(ip) { return ip.replace(/[^a-zA-Z0-9]/g, '_'); }
-  function setStatus(ip, cls, html) {
-    var el = document.getElementById('zprs-' + safeId(ip));
+  function safeId(s) { return s.replace(/[^a-zA-Z0-9]/g, '_'); }
+  function setStatus(s, cls, html) {
+    var el = document.getElementById('zprs-' + safeId(s));
     if (!el) return;
     el.className = 'zip-progress-status ' + cls;
     el.innerHTML = html;
   }
 
-  var done = 0;
-  for (var i = 0; i < SENDER_IPS.length; i++) {
-    var ip = SENDER_IPS[i];
-    setStatus(ip, 'zipping', '&#9881; Zipping&hellip;');
-    try {
-      var res = await fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      await res.blob();
-      done++;
-      setStatus(ip, 'done', '&#10003; Done');
-    } catch (err) {
-      done++;
-      setStatus(ip, 'error', '&#10007; Failed');
+  if (!byRegex) {
+    // ── IP mode: warm per-sender zips, then fetch zip-all ──────────────────
+    var done = 0;
+    for (var i = 0; i < SENDER_IPS.length; i++) {
+      var ip = SENDER_IPS[i];
+      setStatus(ip, 'zipping', '&#9881; Zipping&hellip;');
+      try {
+        var res = await fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await res.blob();
+        done++;
+        setStatus(ip, 'done', '&#10003; Done');
+      } catch (err) {
+        done++;
+        setStatus(ip, 'error', '&#10007; Failed');
+      }
+      progressLabel.textContent = done + ' / ' + SENDER_IPS.length;
+      progressFill.style.width = Math.round(done / SENDER_IPS.length * 90) + '%';
     }
-    progressLabel.textContent = done + ' / ' + SENDER_IPS.length;
-    progressFill.style.width = Math.round(done / SENDER_IPS.length * 90) + '%';
+    try {
+      progressLabel.textContent = 'Packaging all\u2026';
+      var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
+      var blob = await res.blob();
+      progressFill.style.width = '100%';
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a'); a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+    } catch (err) {
+      alert('Download Everything failed: ' + err.message);
+    }
+  } else {
+    // ── Regex mode: collect all visible group file lists, zip each, then zip-all ─
+    var groups = [];
+    document.querySelectorAll('#groupsContainer .ip-body[data-filelist]').forEach(function(body) {
+      var lbl = body.previousElementSibling
+                  ? (body.previousElementSibling.querySelector('.ip-addr') || {}).textContent || 'group'
+                  : 'group';
+      var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
+      if (files.length) groups.push({ lbl: lbl, files: files });
+    });
+    progressLabel.textContent = '0 / ' + groups.length;
+    var done = 0;
+    for (var gi = 0; gi < groups.length; gi++) {
+      var grp = groups[gi];
+      setStatus(grp.lbl, 'zipping', '&#9881; Zipping&hellip;');
+      try {
+        var res = await fetch('/download/zip-selection' + pwQuery, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(grp.files)
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await res.blob();
+        done++;
+        setStatus(grp.lbl, 'done', '&#10003; Done');
+      } catch (err) {
+        done++;
+        setStatus(grp.lbl, 'error', '&#10007; Failed');
+      }
+      progressLabel.textContent = done + ' / ' + groups.length;
+      progressFill.style.width = Math.round(done / groups.length * 90) + '%';
+    }
+    try {
+      progressLabel.textContent = 'Packaging all\u2026';
+      var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
+      if (!res.ok) throw new Error('Server returned ' + res.status);
+      var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
+      var blob = await res.blob();
+      progressFill.style.width = '100%';
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a'); a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+    } catch (err) {
+      alert('Download Everything failed: ' + err.message);
+    }
   }
 
-  try {
-    progressLabel.textContent = 'Packaging all\u2026';
-    var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
-    if (!res.ok) throw new Error('Server returned ' + res.status);
-    var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
-    var blob = await res.blob();
-    progressFill.style.width = '100%';
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
-  } catch (err) {
-    alert('Download Everything failed: ' + err.message);
-  } finally {
-    setTimeout(function() {
-      btn.disabled = false;
-      document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.remove('busy'); });
-      progressBar.classList.remove('visible');
-      progressFill.style.width = '0%';
-      SENDER_IPS.forEach(function(ip) { setStatus(ip, 'waiting', '&#9675; Waiting'); });
-      progressLabel.textContent = '0 / ' + SENDER_IPS.length;
-    }, 1400);
-  }
+  setTimeout(function() {
+    btn.disabled = false;
+    document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.remove('busy'); });
+    progressBar.classList.remove('visible');
+    progressFill.style.width = '0%';
+    SENDER_IPS.forEach(function(ip) { setStatus(ip, 'waiting', '&#9675; Waiting'); });
+    progressLabel.textContent = '0 / ' + SENDER_IPS.length;
+  }, 1400);
 }
 function onGroupByChange(cb) {
   var label = document.getElementById('groupbyToggle');
@@ -2232,8 +2251,7 @@ function rebuildGroups(byRegex) {
   order.forEach(function(lbl) {
     var rows = buckets[lbl];
     var safeId = 'rgrp-' + lbl.replace(/[^a-zA-Z0-9]/g, '_');
-    var encList = rows.map(function(tr) { return '"' + tr.getAttribute('data-enc') + '"'; }).join(',');
-    var encListAttr = rows.map(function(tr) { return tr.getAttribute('data-enc'); }).join(',');
+    var encListSpace = rows.map(function(tr) { return tr.getAttribute('data-enc'); }).join(' ');
     var bodyRows = rows.map(function(tr) { return tr.outerHTML; }).join('');
     html +=
       '<div class="ip-group">' +
@@ -2245,9 +2263,9 @@ function rebuildGroups(byRegex) {
             '<span class="ip-chevron" id="chev-' + safeId + '">&#9650;</span>' +
           '</button>' +
           '<button class="dl-all-btn" onclick="downloadAll(this)" data-group="' + safeId + '" title="Download all files in this group">&#9196; Download All</button>' +
-          '<button class="zip-all-btn" onclick="zipSelection(this)" data-files="' + escHtml(encListAttr) + '" title="Zip and download all files in this group">&#128230; Zip &amp; Download</button>' +
+          '<button class="zip-all-btn" onclick="zipSelection(this)" data-group="' + safeId + '" title="Zip and download all files in this group">&#128230; Zip &amp; Download</button>' +
         '</div>' +
-        '<div class="ip-body" id="' + safeId + '" data-files="[' + encList + ']">' +
+        '<div class="ip-body" id="' + safeId + '" data-filelist="' + escHtml(encListSpace) + '">' +
           '<table>' +
             '<colgroup><col class="col-file"><col class="col-size"><col class="col-date"><col class="col-action"></colgroup>' +
             '<thead><tr><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>' +
