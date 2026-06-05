@@ -3567,7 +3567,7 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                 Send-Redirect $ctx "/download"
             } else {
                 $mode = $req.QueryString["mode"]
-                if ($mode -ne 'filename') { $mode = 'ip' }
+                if ($mode -ne 'fn') { $mode = 'ip' }
                 $allFiles = @(Get-UploadableFiles)
                 if ($allFiles.Count -eq 0) {
                     Send-Response $ctx "<h2>404 — No files found</h2>" -status 404
