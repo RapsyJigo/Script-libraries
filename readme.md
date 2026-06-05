@@ -38,9 +38,10 @@ Check the synposis below the command for a full list of parameters, all except t
 
 .PARAMETER UploadFolder
     Folder where uploaded files are saved. Default: .\uploads
+    Can also be changed live on /admin (localhost only).
 
 .PARAMETER Password
-    Password required to access the download page. Default: changeme
+    Password required to access the download page. Mandatory requested on load
 
 .PARAMETER UploadFileRegex
   Optional regex pattern upload filenames must match (original name, before save).
@@ -48,6 +49,10 @@ Check the synposis below the command for a full list of parameters, all except t
 
 .PARAMETER MaxUploadSize
   Maximum upload size in bytes. 0 = unlimited. Can also be changed live on /admin (localhost only).
+
+.PARAMETER UploadIPWhitelist
+  Comma-separated list of IP addresses allowed to upload. Empty = allow all.
+  Can also be changed live on /admin (localhost only).
 
 .PARAMETER UploadWindowStart
   Optional upload window start (local time). ISO-8601 or "yyyy-MM-dd HH:mm". Empty = no start limit.
@@ -58,9 +63,10 @@ Check the synposis below the command for a full list of parameters, all except t
   Can also be changed live on /admin (localhost only).
 
 .EXAMPLE
-    .\FileServer.ps1
-    .\FileServer.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
-    .\FileServer.ps1 -UploadFileRegex '\.(pdf|docx)$'
+    .\Upload-Download-Server.ps1
+    .\Upload-Download-Server.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
+    .\Upload-Download-Server.ps1 -UploadFileRegex '\.(pdf|docx)$'
+    .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00"
 #>
 ```
 
