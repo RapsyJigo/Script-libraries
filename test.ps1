@@ -620,17 +620,17 @@ function Get-SelectionZipCachePaths([string]$selectionHash) {
     @{
         ZipPath      = Join-Path $cacheDir "selection-$selectionHash.zip"
         ManifestPath = Join-Path $cacheDir "selection-$selectionHash.manifest.json"
-        DisplayName  = "selection-$selectionHash.zip"
     }
 }
 
-function Get-OrBuildSelectionZip([string[]]$fileNames) {
-    # Resolve FileInfo objects for the requested names, preserving only existing files
+function Get-OrBuildSelectionZip([string[]]$fileNames, [string]$label = "selection") {
+    # Resolve FileInfo objects, deduplicate by FullName, preserve only existing files
     $folder   = $script:ServerSettings.UploadFolder
+    $seen     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $zipFiles = @($fileNames | ForEach-Object {
-        $safe = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString($_))
+        $safe = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString([string]$_))
         $fp   = Join-Path $folder $safe
-        if ($safe -and (Test-Path -LiteralPath $fp -PathType Leaf)) {
+        if ($safe -and (Test-Path -LiteralPath $fp -PathType Leaf) -and $seen.Add($fp)) {
             Get-Item -LiteralPath $fp
         }
     } | Where-Object { $null -ne $_ })
@@ -641,13 +641,92 @@ function Get-OrBuildSelectionZip([string[]]$fileNames) {
     $hash        = Get-ZipFingerprintHash $fingerprint
     $paths       = Get-SelectionZipCachePaths $hash
 
+    # Safe display name: strip chars illegal in filenames, fall back to hash prefix
+    $safeName = ($label -replace '[\\/:*?"<>|]', '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = $hash.Substring(0, 8) }
+    $displayName = "selection-$safeName.zip"
+
     if (-not (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
-        Write-ServerLog "Selection zip cache miss ($($zipFiles.Count) files, hash $hash) — rebuilding" -Level Info
+        Write-ServerLog "Selection zip cache miss — label '$safeName', $($zipFiles.Count) file(s), hash $hash" -Level Info
         Build-ZipCache $paths.ZipPath $zipFiles
         Save-ZipCacheManifest $paths.ManifestPath $fingerprint
     } else {
-        Write-ServerLog "Selection zip cache hit ($($zipFiles.Count) files) -> $($paths.ZipPath)" -Level Debug
+        Write-ServerLog "Selection zip cache hit — label '$safeName' -> $($paths.ZipPath)" -Level Debug
     }
+    return @{
+        ZipPath     = $paths.ZipPath
+        ManifestPath = $paths.ManifestPath
+        DisplayName = $displayName
+    }
+}
+
+function Get-AllGroupsZipCachePaths([string]$hash) {
+    $cacheDir = Get-ZipCacheDir
+    @{
+        ZipPath      = Join-Path $cacheDir "all-groups-$hash.zip"
+        ManifestPath = Join-Path $cacheDir "all-groups-$hash.manifest.json"
+        DisplayName  = "all-groups.zip"
+    }
+}
+
+function Get-OrBuildAllGroupsZip([object[]]$groups) {
+    # $groups is an array of @{ Label = <string>; FileNames = [string[]] }
+    # Build each group's selection zip, then assemble into a mega-zip of zips on disk.
+
+    # Fingerprint = sorted file fingerprint across all groups combined
+    $folder    = $script:ServerSettings.UploadFolder
+    $allFiles  = @($groups | ForEach-Object { $_.FileNames } | ForEach-Object {
+        $safe = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString([string]$_))
+        $fp   = Join-Path $folder $safe
+        if ($safe -and (Test-Path -LiteralPath $fp -PathType Leaf)) { Get-Item -LiteralPath $fp }
+    } | Where-Object { $null -ne $_ })
+    if ($allFiles.Count -eq 0) { return $null }
+
+    $fingerprint = Get-ZipSourceFingerprint $allFiles
+    $hash        = Get-ZipFingerprintHash $fingerprint
+    $paths       = Get-AllGroupsZipCachePaths $hash
+
+    if (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint) {
+        Write-ServerLog "All-groups zip cache hit -> $($paths.ZipPath)" -Level Debug
+        return $paths
+    }
+
+    Write-ServerLog "All-groups zip cache miss — building mega zip from $($groups.Count) group(s)" -Level Info
+    $partPath = "$($paths.ZipPath).part"
+    if (Test-Path -LiteralPath $partPath) { Remove-Item -LiteralPath $partPath -Force }
+
+    $fs = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $usedNames = @{}
+            foreach ($grp in $groups) {
+                $selPaths = Get-OrBuildSelectionZip $grp.FileNames $grp.Label
+                if ($null -eq $selPaths) { continue }
+                $entryName = $selPaths.DisplayName
+                $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($entryName)
+                $ext       = [System.IO.Path]::GetExtension($entryName)
+                if ([string]::IsNullOrEmpty($ext)) { $ext = ".zip" }
+                $n = 1
+                while ($usedNames.ContainsKey($entryName.ToLowerInvariant())) {
+                    $n++; $entryName = "$baseName-$n$ext"
+                }
+                $usedNames[$entryName.ToLowerInvariant()] = $true
+                $entry       = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::NoCompression)
+                $entryStream = $entry.Open()
+                try {
+                    $src = [System.IO.File]::OpenRead($selPaths.ZipPath)
+                    try { $src.CopyTo($entryStream) } finally { $src.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $fs.Dispose() }
+
+    if (Test-Path -LiteralPath $paths.ZipPath) { Remove-Item -LiteralPath $paths.ZipPath -Force }
+    Move-Item -LiteralPath $partPath -Destination $paths.ZipPath -Force
+    Save-ZipCacheManifest $paths.ManifestPath $fingerprint
+    $zipSize = (Get-Item -LiteralPath $paths.ZipPath).Length
+    Write-ServerLog "All-groups zip built ($zipSize bytes) -> $($paths.ZipPath)" -Level Ok
     return $paths
 }
 
@@ -2061,10 +2140,14 @@ function zipSelection(btn) {
   var groupId = btn.getAttribute('data-group');
   var body = document.getElementById(groupId);
   var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
-  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '?password=' + encodeURIComponent(DL_PASSWORD) : '';
+  var labelRaw = (body.previousElementSibling
+    ? (body.previousElementSibling.querySelector('.ip-addr') || {}).textContent || 'selection'
+    : 'selection').trim();
+  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
+  var url = '/download/zip-selection?label=' + encodeURIComponent(labelRaw) + pw;
   btn.classList.add('busy');
   btn.textContent = '\u23f3 Zipping\u2026';
-  fetch('/download/zip-selection' + pw, {
+  fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(files)
@@ -2153,22 +2236,23 @@ async function downloadEverything(btn) {
       alert('Download Everything failed: ' + err.message);
     }
   } else {
-    // ── Regex mode: collect all visible group file lists, zip each, then zip-all ─
+    // ── Regex mode: collect all visible groups, warm each selection zip, then build mega-zip ─
     var groups = [];
     document.querySelectorAll('#groupsContainer .ip-body[data-filelist]').forEach(function(body) {
-      var lbl = body.previousElementSibling
-                  ? (body.previousElementSibling.querySelector('.ip-addr') || {}).textContent || 'group'
-                  : 'group';
+      var lbl = (body.previousElementSibling
+        ? (body.previousElementSibling.querySelector('.ip-addr') || {}).textContent || 'group'
+        : 'group').trim();
       var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
-      if (files.length) groups.push({ lbl: lbl, files: files });
+      if (files.length) groups.push({ label: lbl, files: files });
     });
     progressLabel.textContent = '0 / ' + groups.length;
     var done = 0;
+    // Warm each group's selection zip first
     for (var gi = 0; gi < groups.length; gi++) {
       var grp = groups[gi];
-      setStatus(grp.lbl, 'zipping', '&#9881; Zipping&hellip;');
+      setStatus(grp.label, 'zipping', '&#9881; Zipping&hellip;');
       try {
-        var res = await fetch('/download/zip-selection' + pwQuery, {
+        var res = await fetch('/download/zip-selection?label=' + encodeURIComponent(grp.label) + (pwQuery ? '&' + pwQuery.substring(1) : ''), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(grp.files)
@@ -2176,19 +2260,24 @@ async function downloadEverything(btn) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         await res.blob();
         done++;
-        setStatus(grp.lbl, 'done', '&#10003; Done');
+        setStatus(grp.label, 'done', '&#10003; Done');
       } catch (err) {
         done++;
-        setStatus(grp.lbl, 'error', '&#10007; Failed');
+        setStatus(grp.label, 'error', '&#10007; Failed');
       }
       progressLabel.textContent = done + ' / ' + groups.length;
       progressFill.style.width = Math.round(done / groups.length * 90) + '%';
     }
+    // Now assemble the mega-zip from all group selection zips
     try {
       progressLabel.textContent = 'Packaging all\u2026';
-      var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
+      var res = await fetch('/download/zip-all-groups' + pwQuery, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(groups)
+      });
       if (!res.ok) throw new Error('Server returned ' + res.status);
-      var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
+      var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-groups.zip');
       var blob = await res.blob();
       progressFill.style.width = '100%';
       var url = URL.createObjectURL(blob);
@@ -3590,8 +3679,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /download/zip-selection ─────────────────────────────────────
+        # ── POST /download/zip-selection?label=... ───────────────────────────
         # Body: JSON array of URI-encoded filenames. Returns a cached zip of exactly those files.
+        # Optional ?label=<name> sets the downloaded zip filename to selection-<name>.zip
         elseif ($path -eq "/download/zip-selection" -and $method -eq "POST") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3606,7 +3696,39 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                 if ($null -eq $nameList -or $nameList.Count -eq 0) {
                     Send-Response $ctx "<h2>400 — No files specified</h2>" -status 400
                 } else {
-                    $paths = Get-OrBuildSelectionZip $nameList
+                    $label = $req.QueryString["label"]
+                    if ([string]::IsNullOrWhiteSpace($label)) { $label = "selection" }
+                    $paths = Get-OrBuildSelectionZip $nameList $label
+                    if ($null -eq $paths) {
+                        Send-Response $ctx "<h2>404 — No matching files found</h2>" -status 404
+                    } else {
+                        Send-FileStreamResponse $ctx $paths.ZipPath 'application/zip' $paths.DisplayName
+                    }
+                }
+            }
+        }
+
+        # ── POST /download/zip-all-groups ─────────────────────────────────────
+        # Body: JSON array of { label: string, files: string[] }.
+        # Builds each group's selection zip then assembles a mega-zip of all group zips.
+        elseif ($path -eq "/download/zip-all-groups" -and $method -eq "POST") {
+            $token     = Get-CookieToken $req
+            $quickpass = $req.QueryString["password"]
+            $authorized = [string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token) -or ($quickpass -eq $script:ServerSettings.Password)
+            if (-not $authorized) {
+                Send-Response $ctx '{"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $reader    = New-Object System.IO.StreamReader($req.InputStream, [System.Text.Encoding]::UTF8)
+                $body      = $reader.ReadToEnd()
+                $groupList = $null
+                try { $groupList = @($body | ConvertFrom-Json) } catch {}
+                if ($null -eq $groupList -or $groupList.Count -eq 0) {
+                    Send-Response $ctx "<h2>400 — No groups specified</h2>" -status 400
+                } else {
+                    $groups = @($groupList | ForEach-Object {
+                        @{ Label = [string]$_.label; FileNames = @($_.files | ForEach-Object { [string]$_ }) }
+                    })
+                    $paths = Get-OrBuildAllGroupsZip $groups
                     if ($null -eq $paths) {
                         Send-Response $ctx "<h2>404 — No matching files found</h2>" -status 404
                     } else {
@@ -3662,6 +3784,8 @@ function New-RequestRunspacePool {
         'Get-OrBuildAllSendersZip',
         'Get-SelectionZipCachePaths',
         'Get-OrBuildSelectionZip',
+        'Get-AllGroupsZipCachePaths',
+        'Get-OrBuildAllGroupsZip',
         'Send-FileStreamResponse',
         'Send-BytesResponse',
         'Get-ServerSettingsObject',
