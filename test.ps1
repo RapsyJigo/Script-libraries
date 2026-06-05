@@ -556,6 +556,85 @@ function Get-OrBuildFilenameZip([string]$displayName, $zipFiles) {
     return $paths
 }
 
+function Get-MegaZipCachePaths([string]$mode) {
+    $cacheDir = Get-ZipCacheDir
+    @{
+        ZipPath      = Join-Path $cacheDir "mega-$mode.zip"
+        ManifestPath = Join-Path $cacheDir "mega-$mode.manifest.json"
+        DisplayName  = "all-by-$mode.zip"
+    }
+}
+
+function Get-OrBuildMegaZip([string]$mode, $allFiles) {
+    $paths = Get-MegaZipCachePaths $mode
+
+    # Collect the constituent group zips (building/caching each one first)
+    $groupZips = [System.Collections.Generic.List[hashtable]]::new()
+    if ($mode -eq 'filename') {
+        $groups = @($allFiles | Group-Object { Get-DisplayNameFromFileName $_.Name } | Sort-Object Name)
+        foreach ($g in $groups) {
+            $gPaths = Get-OrBuildFilenameZip ([string]$g.Name) @($g.Group)
+            $groupZips.Add($gPaths)
+        }
+    } else {
+        # default: ip
+        $groups = @($allFiles | Group-Object { Get-SenderIpFromFileName $_.Name } | Sort-Object Name)
+        foreach ($g in $groups) {
+            $gPaths = Get-OrBuildSenderZip ([string]$g.Name) @($g.Group)
+            $groupZips.Add($gPaths)
+        }
+    }
+
+    # Fingerprint = sorted list of constituent zip paths + their mtimes
+    $fingerprint = ($groupZips | ForEach-Object {
+        $zi = Get-Item -LiteralPath $_.ZipPath
+        "$($_.ZipPath)|$($zi.LastWriteTimeUtc.Ticks)|$($zi.Length)"
+    }) -join "`n"
+
+    if ((Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
+        Write-ServerLog "Mega-zip cache hit ($mode) -> $($paths.ZipPath)" -Level Debug
+        return $paths
+    }
+
+    Write-ServerLog "Mega-zip cache miss ($mode) — building zip of zips on disk" -Level Info
+    $partPath = "$($paths.ZipPath).part"
+    if (Test-Path -LiteralPath $partPath) { Remove-Item -LiteralPath $partPath -Force }
+
+    $fs = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $usedNames = @{}
+            foreach ($gp in $groupZips) {
+                $entryName = $gp.DisplayName
+                $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($entryName)
+                $ext       = [System.IO.Path]::GetExtension($entryName)
+                if ([string]::IsNullOrEmpty($ext)) { $ext = '.zip' }
+                $n = 1
+                while ($usedNames.ContainsKey($entryName.ToLowerInvariant())) {
+                    $n++
+                    $entryName = "$baseName-$n$ext"
+                }
+                $usedNames[$entryName.ToLowerInvariant()] = $true
+                $entry       = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::NoCompression)
+                $entryStream = $entry.Open()
+                try {
+                    $src = [System.IO.File]::OpenRead($gp.ZipPath)
+                    try { $src.CopyTo($entryStream) } finally { $src.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $fs.Dispose() }
+
+    if (Test-Path -LiteralPath $paths.ZipPath) { Remove-Item -LiteralPath $paths.ZipPath -Force }
+    Move-Item -LiteralPath $partPath -Destination $paths.ZipPath -Force
+    Save-ZipCacheManifest $paths.ManifestPath $fingerprint
+
+    $zipSize = (Get-Item -LiteralPath $paths.ZipPath).Length
+    Write-ServerLog "Mega-zip ($mode) built on disk ($zipSize bytes) -> $($paths.ZipPath)" -Level Ok
+    return $paths
+}
+
 function Get-AllSendersZipCachePaths {
     $cacheDir = Get-ZipCacheDir
     @{
@@ -1955,21 +2034,11 @@ function Get-DownloadPage {
 <div class="page">
   <div class="dl-content">
     $(if ($files.Count -gt 0) {
-      $totalGroups = $grouped.Count + $groupedByName.Count
       "<div class='dl-everything-bar'><button type='button' id='downloadEverythingBtn' class='dl-everything-btn' onclick='downloadEverything(this)'>&#128230; Download Everything</button></div>" +
       "<div class='zip-progress-bar' id='zipProgressBar'>" +
-        "<div class='zip-progress-header'><span>&#9889; Packaging</span> <strong id='zipProgressLabel'>0 / $totalGroups</strong> <span>group$(if($totalGroups -ne 1){'s'})</span></div>" +
+        "<div class='zip-progress-header'><span>&#9889; Packaging</span> <strong id='zipProgressLabel'>0 / ?</strong></div>" +
         "<div class='zip-progress-track'><div class='zip-progress-fill' id='zipProgressFill'></div></div>" +
-        "<div class='zip-progress-rows' id='zipProgressRows'>" +
-          (($grouped | ForEach-Object {
-            $ip = [System.Net.WebUtility]::HtmlEncode($_.Name)
-            "<div class='zip-progress-row' id='zpr-ip-$($ip -replace '[^a-zA-Z0-9]','_')'><span class='zip-progress-ip'>&#127760; $ip</span><span class='zip-progress-status waiting' id='zprs-ip-$($ip -replace '[^a-zA-Z0-9]','_')'>&#9675; Waiting</span></div>"
-          }) -join "") +
-          (($groupedByName | ForEach-Object {
-            $fn = [System.Net.WebUtility]::HtmlEncode($_.Name)
-            "<div class='zip-progress-row' id='zpr-fn-$(($_.Name) -replace '[^a-zA-Z0-9]','_')'><span class='zip-progress-ip'>&#128196; $fn</span><span class='zip-progress-status waiting' id='zprs-fn-$(($_.Name) -replace '[^a-zA-Z0-9]','_')'>&#9675; Waiting</span></div>"
-          }) -join "") +
-        "</div>" +
+        "<div class='zip-progress-rows' id='zipProgressRows'></div>" +
       "</div>"
     })
     $(if ($files.Count -gt 0) {
@@ -2075,30 +2144,43 @@ function zipAll(btn) {
       btn.textContent = '\u{1F4E6} Zip & Download';
     });
 }
-function sanitizeZipName(name) {
-  return String(name || 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_') || 'unknown';
-}
-function filenameFromDisposition(header, fallback) {
-  var cd = header || '';
-  var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
-  return match ? decodeURIComponent(match[1].replace(/"/g, '')) : fallback;
-}
 async function downloadEverything(btn) {
-  var totalGroups = SENDER_IPS.length + FILENAME_GROUPS.length;
-  if (!totalGroups) return;
+  // Determine which view is active
+  var activePanel = document.querySelector('.view-panel.active');
+  var mode = activePanel && activePanel.id === 'view-fn' ? 'fn' : 'ip';
+  var groups = mode === 'fn' ? FILENAME_GROUPS : SENDER_IPS;
+  var icon   = mode === 'fn' ? '\uD83D\uDCC4' : '\uD83C\uDF10';
+
+  if (!groups.length) return;
+
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
+  var totalGroups = groups.length;
 
   btn.disabled = true;
   document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.add('busy'); });
 
+  // Build progress rows for just this view's groups
   var progressBar   = document.getElementById('zipProgressBar');
   var progressLabel = document.getElementById('zipProgressLabel');
   var progressFill  = document.getElementById('zipProgressFill');
+  var progressRows  = document.getElementById('zipProgressRows');
+
+  progressRows.innerHTML = groups.map(function(name) {
+    var safeId = (mode + '_' + name).replace(/[^a-zA-Z0-9]/g, '_');
+    var enc = encodeURIComponent(name).replace(/'/g, '%27');
+    return "<div class='zip-progress-row'>" +
+      "<span class='zip-progress-ip'>" + icon + " " + name.replace(/</g,'&lt;').replace(/>/g,'&gt;') + "</span>" +
+      "<span class='zip-progress-status waiting' id='zprs-" + safeId + "'>\u25CB Waiting</span>" +
+      "</div>";
+  }).join('');
+
+  progressLabel.textContent = '0 / ' + totalGroups;
+  progressFill.style.width = '0%';
   progressBar.classList.add('visible');
 
-  function safeId(prefix, name) { return prefix + '_' + name.replace(/[^a-zA-Z0-9]/g, '_'); }
-  function setStatus(prefix, name, cls, html) {
-    var el = document.getElementById('zprs-' + safeId(prefix, name));
+  function setStatus(name, cls, html) {
+    var safeId = (mode + '_' + name).replace(/[^a-zA-Z0-9]/g, '_');
+    var el = document.getElementById('zprs-' + safeId);
     if (!el) return;
     el.className = 'zip-progress-status ' + cls;
     el.innerHTML = html;
@@ -2106,47 +2188,36 @@ async function downloadEverything(btn) {
 
   var done = 0;
 
-  // Step 1: zip all IP groups
-  for (var i = 0; i < SENDER_IPS.length; i++) {
-    var ip = SENDER_IPS[i];
-    setStatus('ip', ip, 'zipping', '&#9881; Zipping&hellip;');
+  // Step 1: zip each group on the server (builds + caches each group zip)
+  for (var i = 0; i < groups.length; i++) {
+    var name = groups[i];
+    setStatus(name, 'zipping', '\u2699 Zipping\u2026');
+    var zipUrl = mode === 'fn'
+      ? '/download/zip?filename=' + encodeURIComponent(name) + pw
+      : '/download/zip?ip='       + encodeURIComponent(name) + pw;
     try {
-      var res = await fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw);
+      var res = await fetch(zipUrl);
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      await res.blob();
-      setStatus('ip', ip, 'done', '&#10003; Done');
+      await res.blob(); // consume body so connection is released
+      setStatus(name, 'done', '\u2713 Done');
     } catch (err) {
-      setStatus('ip', ip, 'error', '&#10007; Failed');
+      setStatus(name, 'error', '\u2717 Failed');
     }
     done++;
     progressLabel.textContent = done + ' / ' + totalGroups;
-    progressFill.style.width = Math.round(done / totalGroups * 90) + '%';
+    progressFill.style.width = Math.round(done / totalGroups * 88) + '%';
   }
 
-  // Step 2: zip all filename groups
-  for (var j = 0; j < FILENAME_GROUPS.length; j++) {
-    var fn = FILENAME_GROUPS[j];
-    setStatus('fn', fn, 'zipping', '&#9881; Zipping&hellip;');
-    try {
-      var res2 = await fetch('/download/zip?filename=' + encodeURIComponent(fn) + pw);
-      if (!res2.ok) throw new Error('HTTP ' + res2.status);
-      await res2.blob();
-      setStatus('fn', fn, 'done', '&#10003; Done');
-    } catch (err) {
-      setStatus('fn', fn, 'error', '&#10007; Failed');
-    }
-    done++;
-    progressLabel.textContent = done + ' / ' + totalGroups;
-    progressFill.style.width = Math.round(done / totalGroups * 90) + '%';
-  }
-
-  // Step 3: fetch the mega zip of all IP-sender zips
+  // Step 2 + 3: ask server to zip all the group zips into one mega zip, then download it
   try {
-    progressLabel.textContent = 'Packaging all\u2026';
-    var res3 = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
-    if (!res3.ok) throw new Error('Server returned ' + res3.status);
-    var filename = filenameFromDisposition(res3.headers.get('Content-Disposition'), 'all-senders.zip');
-    var blob = await res3.blob();
+    progressLabel.textContent = 'Packaging\u2026';
+    var megaUrl = '/download/zip-mega?mode=' + mode + pw;
+    var megaRes = await fetch(megaUrl);
+    if (!megaRes.ok) throw new Error('Server returned ' + megaRes.status);
+    var cd = megaRes.headers.get('Content-Disposition') || '';
+    var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
+    var filename = match ? decodeURIComponent(match[1].replace(/"/g, '')) : 'everything.zip';
+    var blob = await megaRes.blob();
     progressFill.style.width = '100%';
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
@@ -2164,9 +2235,8 @@ async function downloadEverything(btn) {
       document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.remove('busy'); });
       progressBar.classList.remove('visible');
       progressFill.style.width = '0%';
-      SENDER_IPS.forEach(function(ip) { setStatus('ip', ip, 'waiting', '&#9675; Waiting'); });
-      FILENAME_GROUPS.forEach(function(fn) { setStatus('fn', fn, 'waiting', '&#9675; Waiting'); });
-      progressLabel.textContent = '0 / ' + totalGroups;
+      progressRows.innerHTML = '';
+      progressLabel.textContent = '0 / ?';
     }, 1400);
   }
 }
@@ -3488,6 +3558,26 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
+        # ── GET /download/zip-mega?mode=ip|filename ──────────────────────────
+        elseif ($path -eq "/download/zip-mega") {
+            $token     = Get-CookieToken $req
+            $quickpass = $req.QueryString["password"]
+            $authorized = [string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token) -or ($quickpass -eq $script:ServerSettings.Password)
+            if (-not $authorized) {
+                Send-Redirect $ctx "/download"
+            } else {
+                $mode = $req.QueryString["mode"]
+                if ($mode -ne 'filename') { $mode = 'ip' }
+                $allFiles = @(Get-UploadableFiles)
+                if ($allFiles.Count -eq 0) {
+                    Send-Response $ctx "<h2>404 — No files found</h2>" -status 404
+                } else {
+                    $megaZip = Get-OrBuildMegaZip $mode $allFiles
+                    Send-FileStreamResponse $ctx $megaZip.ZipPath 'application/zip' $megaZip.DisplayName
+                }
+            }
+        }
+
         # ── 404 ──────────────────────────────────────────────────────────────
         else {
             Write-ServerLog "404 Not Found: $method $path" -Level Warn
@@ -3528,6 +3618,8 @@ function New-RequestRunspacePool {
         'Find-SevenZipExe',
         'Build-ZipCache',
         'Save-ZipCacheManifest',
+        'Get-MegaZipCachePaths',
+        'Get-OrBuildMegaZip',
         'Get-DisplayNameFromFileName',
         'Get-FilenameZipCachePaths',
         'Get-OrBuildFilenameZip',
