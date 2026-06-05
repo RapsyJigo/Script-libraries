@@ -3051,7 +3051,7 @@ foreach ($ip in $privateIP) {
   Write-Host "  Upload Page   : http://${ip}:$Port/" -ForegroundColor Blue
   Write-Host "  Download Page : http://${ip}:$Port/download" -ForegroundColor Blue
 }
-Write-Host "  Upload Folder : $($script:ServerSettings.UploadFolder)" -ForegroundColor DarkBlue
+Write-Host "  Upload Folder : $($script:ServerSettings.UploadFolder)" -ForegroundColor DarkGreen
 Write-Host "  Admin Page    : http://127.0.0.1:$Port/admin  (localhost only)" -ForegroundColor DarkCyan
 if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) {
   Write-Host "  Upload Regex  : $($script:ServerSettings.UploadFileRegex)" -ForegroundColor DarkCyan
@@ -3074,11 +3074,6 @@ else {
 }
 Write-Host "  Local IP      : $privateIP" -ForegroundColor DarkGray
 Write-Host "  Public IP     : $publicIP" -ForegroundColor DarkGray
-Write-Host ""
-if ($upnpStatus) {
-    $upnpColor = if ($upnpStatus -like "UPnP mapping added*") { "Green" } else { "Yellow" }
-    Write-Host "  UPnP          : $upnpStatus" -ForegroundColor $upnpColor
-}
 if ($portOpen) {
     Write-Host "  Port $Port is open — server is reachable from the internet at http://${publicIP}:$Port/" -ForegroundColor Green
 } else {
