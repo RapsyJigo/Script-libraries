@@ -523,6 +523,39 @@ function Get-OrBuildSenderZip([string]$senderIp, $zipFiles) {
     return $paths
 }
 
+function Get-DisplayNameFromFileName([string]$filename) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($filename)
+    $ext  = [System.IO.Path]::GetExtension($filename)
+    $clean = $stem -replace '-\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:_\d+)?$', ''
+    $clean = $clean -replace '-[0-9a-fA-F\-]{7,}(?:_\d+)?$', ''
+    if (-not $clean) { $clean = $stem }
+    return "$clean$ext"
+}
+
+function Get-FilenameZipCachePaths([string]$displayName) {
+    $safe = ($displayName -replace '[^a-zA-Z0-9\.\-]', '_').TrimEnd('_')
+    if (-not $safe) { $safe = "group" }
+    $cacheDir = Get-ZipCacheDir
+    @{
+        ZipPath      = Join-Path $cacheDir "fname-$safe.zip"
+        ManifestPath = Join-Path $cacheDir "fname-$safe.manifest.json"
+        DisplayName  = "files-$safe.zip"
+    }
+}
+
+function Get-OrBuildFilenameZip([string]$displayName, $zipFiles) {
+    $paths = Get-FilenameZipCachePaths $displayName
+    $fingerprint = Get-ZipSourceFingerprint $zipFiles
+    if (-not (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
+        Write-ServerLog "Zip cache miss for filename group '$displayName' — rebuilding" -Level Info
+        Build-ZipCache $paths.ZipPath $zipFiles
+        Save-ZipCacheManifest $paths.ManifestPath $fingerprint
+    } else {
+        Write-ServerLog "Zip cache hit for filename group '$displayName' -> $($paths.ZipPath)" -Level Debug
+    }
+    return $paths
+}
+
 function Get-AllSendersZipCachePaths {
     $cacheDir = Get-ZipCacheDir
     @{
@@ -613,121 +646,6 @@ function Get-OrBuildAllSendersZip($files) {
     } finally {
         [System.Threading.Monitor]::Exit($script:AllSendersZipLock)
     }
-}
-
-function Get-SelectionZipCachePaths([string]$selectionHash) {
-    $cacheDir = Get-ZipCacheDir
-    @{
-        ZipPath      = Join-Path $cacheDir "selection-$selectionHash.zip"
-        ManifestPath = Join-Path $cacheDir "selection-$selectionHash.manifest.json"
-    }
-}
-
-function Get-OrBuildSelectionZip([string[]]$fileNames, [string]$label = "selection") {
-    # Resolve FileInfo objects, deduplicate by FullName, preserve only existing files
-    $folder   = $script:ServerSettings.UploadFolder
-    $seen     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $zipFiles = @($fileNames | ForEach-Object {
-        $safe = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString([string]$_))
-        $fp   = Join-Path $folder $safe
-        if ($safe -and (Test-Path -LiteralPath $fp -PathType Leaf) -and $seen.Add($fp)) {
-            Get-Item -LiteralPath $fp
-        }
-    } | Where-Object { $null -ne $_ })
-
-    if ($zipFiles.Count -eq 0) { return $null }
-
-    $fingerprint = Get-ZipSourceFingerprint $zipFiles
-    $hash        = Get-ZipFingerprintHash $fingerprint
-    $paths       = Get-SelectionZipCachePaths $hash
-
-    # Safe display name: strip chars illegal in filenames, fall back to hash prefix
-    $safeName = ($label -replace '[\\/:*?"<>|]', '_').Trim()
-    if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = $hash.Substring(0, 8) }
-    $displayName = "selection-$safeName.zip"
-
-    if (-not (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint)) {
-        Write-ServerLog "Selection zip cache miss — label '$safeName', $($zipFiles.Count) file(s), hash $hash" -Level Info
-        Build-ZipCache $paths.ZipPath $zipFiles
-        Save-ZipCacheManifest $paths.ManifestPath $fingerprint
-    } else {
-        Write-ServerLog "Selection zip cache hit — label '$safeName' -> $($paths.ZipPath)" -Level Debug
-    }
-    return @{
-        ZipPath     = $paths.ZipPath
-        ManifestPath = $paths.ManifestPath
-        DisplayName = $displayName
-    }
-}
-
-function Get-AllGroupsZipCachePaths([string]$hash) {
-    $cacheDir = Get-ZipCacheDir
-    @{
-        ZipPath      = Join-Path $cacheDir "all-groups-$hash.zip"
-        ManifestPath = Join-Path $cacheDir "all-groups-$hash.manifest.json"
-        DisplayName  = "all-groups.zip"
-    }
-}
-
-function Get-OrBuildAllGroupsZip([object[]]$groups) {
-    # $groups is an array of @{ Label = <string>; FileNames = [string[]] }
-    # Build each group's selection zip, then assemble into a mega-zip of zips on disk.
-
-    # Fingerprint = sorted file fingerprint across all groups combined
-    $folder    = $script:ServerSettings.UploadFolder
-    $allFiles  = @($groups | ForEach-Object { $_.FileNames } | ForEach-Object {
-        $safe = [System.IO.Path]::GetFileName([Uri]::UnescapeDataString([string]$_))
-        $fp   = Join-Path $folder $safe
-        if ($safe -and (Test-Path -LiteralPath $fp -PathType Leaf)) { Get-Item -LiteralPath $fp }
-    } | Where-Object { $null -ne $_ })
-    if ($allFiles.Count -eq 0) { return $null }
-
-    $fingerprint = Get-ZipSourceFingerprint $allFiles
-    $hash        = Get-ZipFingerprintHash $fingerprint
-    $paths       = Get-AllGroupsZipCachePaths $hash
-
-    if (Test-ZipCacheValid $paths.ManifestPath $paths.ZipPath $fingerprint) {
-        Write-ServerLog "All-groups zip cache hit -> $($paths.ZipPath)" -Level Debug
-        return $paths
-    }
-
-    Write-ServerLog "All-groups zip cache miss — building mega zip from $($groups.Count) group(s)" -Level Info
-    $partPath = "$($paths.ZipPath).part"
-    if (Test-Path -LiteralPath $partPath) { Remove-Item -LiteralPath $partPath -Force }
-
-    $fs = [System.IO.File]::Open($partPath, [System.IO.FileMode]::CreateNew)
-    try {
-        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
-        try {
-            $usedNames = @{}
-            foreach ($grp in $groups) {
-                $selPaths = Get-OrBuildSelectionZip $grp.FileNames $grp.Label
-                if ($null -eq $selPaths) { continue }
-                $entryName = $selPaths.DisplayName
-                $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($entryName)
-                $ext       = [System.IO.Path]::GetExtension($entryName)
-                if ([string]::IsNullOrEmpty($ext)) { $ext = ".zip" }
-                $n = 1
-                while ($usedNames.ContainsKey($entryName.ToLowerInvariant())) {
-                    $n++; $entryName = "$baseName-$n$ext"
-                }
-                $usedNames[$entryName.ToLowerInvariant()] = $true
-                $entry       = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::NoCompression)
-                $entryStream = $entry.Open()
-                try {
-                    $src = [System.IO.File]::OpenRead($selPaths.ZipPath)
-                    try { $src.CopyTo($entryStream) } finally { $src.Dispose() }
-                } finally { $entryStream.Dispose() }
-            }
-        } finally { $zip.Dispose() }
-    } finally { $fs.Dispose() }
-
-    if (Test-Path -LiteralPath $paths.ZipPath) { Remove-Item -LiteralPath $paths.ZipPath -Force }
-    Move-Item -LiteralPath $partPath -Destination $paths.ZipPath -Force
-    Save-ZipCacheManifest $paths.ManifestPath $fingerprint
-    $zipSize = (Get-Item -LiteralPath $paths.ZipPath).Length
-    Write-ServerLog "All-groups zip built ($zipSize bytes) -> $($paths.ZipPath)" -Level Ok
-    return $paths
 }
 
 function Send-FileStreamResponse(
@@ -1745,73 +1663,29 @@ function Get-DownloadPage {
     $senderIpsJson = ConvertTo-Json -InputObject @($grouped | ForEach-Object { [string]$_.Name }) -Compress
     if (-not $senderIpsJson) { $senderIpsJson = "[]" }
 
-    # Build per-file regex group label map (for client-side regex grouping)
-    # Key = URI-encoded filename, Value = regex group label string
-    $regexPattern = $script:ServerSettings.UploadFileRegex
-    $regexActive  = -not [string]::IsNullOrWhiteSpace($regexPattern)
-    $fileRegexGroupsObj = [ordered]@{}
-    if ($regexActive) {
-        foreach ($f in $files) {
-            $dispName = Get-DisplayName $f.Name
-            $label    = "Other"
-            try {
-                $m = [System.Text.RegularExpressions.Regex]::Match($dispName, $regexPattern)
-                if ($m.Success) {
-                    # Use first named or numbered capture group; fall back to full match
-                    if ($m.Groups.Count -gt 1) {
-                        # Find first non-empty capture group
-                        for ($gi = 1; $gi -lt $m.Groups.Count; $gi++) {
-                            if ($m.Groups[$gi].Success -and $m.Groups[$gi].Value -ne '') {
-                                $label = $m.Groups[$gi].Value; break
-                            }
-                        }
-                        if ($label -eq "Other") { $label = $m.Value }
-                    } else {
-                        $label = $m.Value
-                    }
-                }
-            } catch { $label = "Other" }
-            $fileRegexGroupsObj[[Uri]::EscapeDataString($f.Name)] = $label
-        }
-    }
-    $fileRegexGroupsJson = if ($fileRegexGroupsObj.Count -gt 0) {
-        '{' + (($fileRegexGroupsObj.GetEnumerator() | ForEach-Object {
-            '"' + ($_.Key -replace '"','\"') + '":"' + ($_.Value -replace '\\','\\\\' -replace '"','\"') + '"'
-        }) -join ',') + '}'
-    } else { '{}' }
-    $regexActiveJs = if ($regexActive) { 'true' } else { 'false' }
-    $regexPatternJs = if ($regexActive) { '"' + ($regexPattern -replace '\\','\\\\' -replace '"','\"') + '"' } else { 'null' }
+    # Group files by display filename (stripped of IP suffix)
+    $groupedByName = @($files | Group-Object { Get-DisplayName $_.Name } | Sort-Object Name)
+    $filenameGroupsJson = ConvertTo-Json -InputObject @($groupedByName | ForEach-Object { [string]$_.Name }) -Compress
+    if (-not $filenameGroupsJson) { $filenameGroupsJson = "[]" }
 
-    $groupHtml = if ($files.Count -eq 0) {
-        "<div class='empty-state'><div class='empty-state-icon'>&#128228;</div>No files uploaded yet.<br>Head to the upload page to send some files.</div>"
-    } else {
-        ($grouped | ForEach-Object {
-            $ip       = [System.Net.WebUtility]::HtmlEncode($_.Name)
-            $groupId  = "grp-" + ($ip -replace '[^a-zA-Z0-9]', '_')
-            $count    = $_.Group.Count
-            $encListSpace = ($_.Group | ForEach-Object { [Uri]::EscapeDataString($_.Name) }) -join ' '
-            $rowsHtml = ($_.Group | ForEach-Object {
-                $dispName = [System.Net.WebUtility]::HtmlEncode((Get-DisplayName $_.Name))
-                $rawName  = [System.Net.WebUtility]::HtmlEncode($_.Name)
-                $enc      = [Uri]::EscapeDataString($_.Name)
-                $size     = if ($_.Length -lt 1024) { "$($_.Length) B" } elseif ($_.Length -lt 1048576) { "{0:N1} KB" -f ($_.Length/1KB) } elseif ($_.Length -lt 1073741824) { "{0:N1} MB" -f ($_.Length/1MB) } else { "{0:N1} GB" -f ($_.Length/1GB) }
-                $date     = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
-                "<tr data-enc='$enc' data-ip='$ip'><td><a href='/download/file?name=$enc' class='dl-link dl-href' title='$rawName'>&#128196;&nbsp;$dispName</a></td><td>$size</td><td>$date</td><td><button class='copy-url-btn' data-name='$enc' onclick=`"copyUrl(this)`" title='Copy direct download link'>&#128279;<span class='url-label'> Copy URL</span></button></td></tr>"
-            }) -join "`n"
-
-            @"
+    # Helper: render a single group card
+    function Render-GroupCard([string]$groupId, [string]$icon, [string]$label, [string]$encListJson,
+                              [string]$dlGroupAttr, [string]$zipAttrName, [string]$zipAttrValue,
+                              [string]$rowsHtml, [int]$count) {
+        $safeZipAttr = [System.Net.WebUtility]::HtmlEncode($zipAttrValue)
+        @"
 <div class="ip-group">
   <div class="ip-header-row">
     <button class="ip-header" onclick="toggleGroup('$groupId')" aria-expanded="true">
-      <span class="ip-icon">&#127760;</span>
-      <span class="ip-addr">$ip</span>
+      <span class="ip-icon">$icon</span>
+      <span class="ip-addr">$label</span>
       <span class="ip-count badge">$count file$(if($count -ne 1){'s'})</span>
       <span class="ip-chevron" id="chev-$groupId">&#9650;</span>
     </button>
-    <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files from this sender">&#9196; Download All</button>
-    <button class="zip-all-btn" onclick="zipSelection(this)" data-group="$groupId" title="Zip and download all files from this sender">&#128230; Zip &amp; Download</button>
+    <button class="dl-all-btn" onclick="downloadAll(this)" data-group="$groupId" title="Download all files in this group">&#9196; Download All</button>
+    <button class="zip-all-btn" onclick="zipAll(this)" $zipAttrName="$safeZipAttr" title="Zip and download all files in this group">&#128230; Zip &amp; Download</button>
   </div>
-  <div class="ip-body" id="$groupId" data-filelist="$encListSpace" data-ip="$ip">
+  <div class="ip-body" id="$groupId" data-files="[$encListJson]">
     <table>
       <colgroup><col class="col-file"><col class="col-size"><col class="col-date"><col class="col-action"></colgroup>
       <thead><tr><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
@@ -1820,6 +1694,42 @@ function Get-DownloadPage {
   </div>
 </div>
 "@
+    }
+
+    function Render-FileRows($fileList) {
+        ($fileList | ForEach-Object {
+            $dispName = [System.Net.WebUtility]::HtmlEncode((Get-DisplayName $_.Name))
+            $rawName  = [System.Net.WebUtility]::HtmlEncode($_.Name)
+            $enc      = [Uri]::EscapeDataString($_.Name)
+            $size     = if ($_.Length -lt 1024) { "$($_.Length) B" } elseif ($_.Length -lt 1048576) { "{0:N1} KB" -f ($_.Length/1KB) } elseif ($_.Length -lt 1073741824) { "{0:N1} MB" -f ($_.Length/1MB) } else { "{0:N1} GB" -f ($_.Length/1GB) }
+            $date     = $_.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+            "<tr><td><a href='/download/file?name=$enc' class='dl-link dl-href' title='$rawName'>&#128196;&nbsp;$dispName</a></td><td>$size</td><td>$date</td><td><button class='copy-url-btn' data-name='$enc' onclick=`"copyUrl(this)`" title='Copy direct download link'>&#128279;<span class='url-label'> Copy URL</span></button></td></tr>"
+        }) -join "`n"
+    }
+
+    $groupHtmlByIp = if ($files.Count -eq 0) {
+        "<div class='empty-state'><div class='empty-state-icon'>&#128228;</div>No files uploaded yet.<br>Head to the upload page to send some files.</div>"
+    } else {
+        ($grouped | ForEach-Object {
+            $ip         = [System.Net.WebUtility]::HtmlEncode($_.Name)
+            $groupId    = "grp-ip-" + ($ip -replace '[^a-zA-Z0-9]', '_')
+            $count      = $_.Group.Count
+            $encListJson = ($_.Group | ForEach-Object { '&quot;' + [Uri]::EscapeDataString($_.Name) + '&quot;' }) -join ','
+            $rowsHtml   = Render-FileRows $_.Group
+            Render-GroupCard $groupId "&#127760;" $ip $encListJson "" "data-ip" $_.Name $rowsHtml $count
+        }) -join "`n"
+    }
+
+    $groupHtmlByName = if ($files.Count -eq 0) {
+        ""
+    } else {
+        ($groupedByName | ForEach-Object {
+            $fname      = [System.Net.WebUtility]::HtmlEncode($_.Name)
+            $groupId    = "grp-fn-" + (($_.Name) -replace '[^a-zA-Z0-9]', '_')
+            $count      = $_.Group.Count
+            $encListJson = ($_.Group | ForEach-Object { '&quot;' + [Uri]::EscapeDataString($_.Name) + '&quot;' }) -join ','
+            $rowsHtml   = Render-FileRows $_.Group
+            Render-GroupCard $groupId "&#128196;" $fname $encListJson "" "data-filename" $_.Name $rowsHtml $count
         }) -join "`n"
     }
 
@@ -1837,6 +1747,23 @@ function Get-DownloadPage {
     border: 1px solid var(--border); background: rgba(255,255,255,.04);
   }
   .stat-pill strong { color: var(--text); }
+
+  /* ── View tabs ── */
+  .view-tabs {
+    display: flex; gap: .5rem; margin-bottom: 1.2rem; flex-wrap: wrap;
+  }
+  .view-tab {
+    padding: .45rem 1.1rem; border-radius: 999px;
+    font-family: var(--mono); font-size: .8rem; font-weight: 500;
+    color: var(--muted); background: transparent;
+    border: 1.5px solid var(--border); cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s;
+    white-space: nowrap;
+  }
+  .view-tab:hover { color: var(--accent2); border-color: var(--accent2); background: rgba(0,221,255,.07); }
+  .view-tab.active { color: #0d0d0f; background: var(--accent2); border-color: var(--accent2); }
+  .view-panel { display: none; }
+  .view-panel.active { display: block; }
 
   /* ── Group card ── */
   .ip-group {
@@ -1936,34 +1863,9 @@ function Get-DownloadPage {
 
   /* ── Download Everything bar (always full label, centered) ── */
   .dl-everything-bar {
-    display: flex; flex-direction: column; align-items: center; gap: .75rem;
+    display: flex; justify-content: center; align-items: center;
     padding: .9rem 0 1.4rem;
   }
-  /* ── Group-by toggle ── */
-  .groupby-toggle {
-    display: inline-flex; align-items: center; gap: .55rem;
-    background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 999px; padding: .3rem .75rem .3rem .55rem;
-    font-family: var(--mono); font-size: .78rem; color: var(--muted);
-    cursor: pointer; user-select: none; transition: border-color .2s, color .2s;
-    white-space: nowrap; flex-wrap: nowrap;
-  }
-  .groupby-toggle:hover { border-color: var(--accent); color: var(--text); }
-  .groupby-toggle input[type=checkbox] { display: none; }
-  .toggle-track {
-    display: inline-flex; align-items: center;
-    width: 2rem; height: 1.1rem; border-radius: 999px;
-    background: var(--border); transition: background .2s;
-    flex-shrink: 0; position: relative;
-  }
-  .toggle-thumb {
-    position: absolute; left: .15rem;
-    width: .8rem; height: .8rem; border-radius: 50%;
-    background: var(--muted); transition: left .2s, background .2s;
-  }
-  .groupby-toggle.active .toggle-track { background: var(--accent); }
-  .groupby-toggle.active .toggle-thumb { left: calc(2rem - .8rem - .15rem); background: #fff; }
-  .groupby-toggle.active { color: var(--accent2); border-color: var(--accent); }
   .dl-everything-btn {
     display: inline-flex; align-items: center; gap: .5rem;
     padding: .65rem 1.5rem;
@@ -2020,9 +1922,6 @@ function Get-DownloadPage {
     .dl-all-btn, .zip-all-btn { padding: .5rem .65rem; font-size: .7rem; gap: .25rem; }
     /* Download Everything always shows full text — no collapse */
     .dl-everything-btn { padding: .6rem 1.2rem; font-size: .78rem; }
-    /* Group-by toggle: keep compact but readable */
-    .groupby-toggle { font-size: .74rem; padding: .28rem .65rem .28rem .48rem; gap: .45rem; }
-    .dl-everything-bar { gap: .6rem; padding: .75rem 0 1.2rem; }
     /* Table: hide date column, shrink size column */
     col.col-date { display: none; }
     th:nth-child(3), td:nth-child(3) { display: none; }
@@ -2045,6 +1944,7 @@ function Get-DownloadPage {
   <span class="topbar-meta">
     <span class="stat-pill">&#128196; <strong>$($files.Count)</strong> file$(if($files.Count -ne 1){'s'})</span>
     <span class="stat-pill">&#127760; <strong>$($grouped.Count)</strong> sender$(if($grouped.Count -ne 1){'s'})</span>
+    <span class="stat-pill">&#128196; <strong>$($groupedByName.Count)</strong> filename$(if($groupedByName.Count -ne 1){'s'})</span>
   </span>
   <nav class="topbar-nav">
     <a href="/">&larr; Upload</a>
@@ -2055,47 +1955,50 @@ function Get-DownloadPage {
 <div class="page">
   <div class="dl-content">
     $(if ($files.Count -gt 0) {
-      $toggleHtml = if ($regexActive) {
-        "<label class='groupby-toggle' id='groupbyToggle' title='Switch grouping between sender IP and regex match'>" +
-          "<input type='checkbox' id='groupbyCheck' onchange='onGroupByChange(this)'>" +
-          "<span class='toggle-track'><span class='toggle-thumb'></span></span>" +
-          "&#128273; Group by pattern" +
-        "</label>"
-      } else { "" }
-      "<div class='dl-everything-bar'>" +
-        $toggleHtml +
-        "<button type='button' id='downloadEverythingBtn' class='dl-everything-btn' onclick='downloadEverything(this)'>&#128230; Download Everything</button>" +
-      "</div>" +
+      $totalGroups = $grouped.Count + $groupedByName.Count
+      "<div class='dl-everything-bar'><button type='button' id='downloadEverythingBtn' class='dl-everything-btn' onclick='downloadEverything(this)'>&#128230; Download Everything</button></div>" +
       "<div class='zip-progress-bar' id='zipProgressBar'>" +
-        "<div class='zip-progress-header'><span>&#9889; Packaging</span> <strong id='zipProgressLabel'>0 / $($grouped.Count)</strong> <span>sender$(if($grouped.Count -ne 1){'s'})</span></div>" +
+        "<div class='zip-progress-header'><span>&#9889; Packaging</span> <strong id='zipProgressLabel'>0 / $totalGroups</strong> <span>group$(if($totalGroups -ne 1){'s'})</span></div>" +
         "<div class='zip-progress-track'><div class='zip-progress-fill' id='zipProgressFill'></div></div>" +
         "<div class='zip-progress-rows' id='zipProgressRows'>" +
           (($grouped | ForEach-Object {
             $ip = [System.Net.WebUtility]::HtmlEncode($_.Name)
-            "<div class='zip-progress-row' id='zpr-$($ip -replace '[^a-zA-Z0-9]','_')'><span class='zip-progress-ip'>$ip</span><span class='zip-progress-status waiting' id='zprs-$($ip -replace '[^a-zA-Z0-9]','_')'>&#9675; Waiting</span></div>"
+            "<div class='zip-progress-row' id='zpr-ip-$($ip -replace '[^a-zA-Z0-9]','_')'><span class='zip-progress-ip'>&#127760; $ip</span><span class='zip-progress-status waiting' id='zprs-ip-$($ip -replace '[^a-zA-Z0-9]','_')'>&#9675; Waiting</span></div>"
+          }) -join "") +
+          (($groupedByName | ForEach-Object {
+            $fn = [System.Net.WebUtility]::HtmlEncode($_.Name)
+            "<div class='zip-progress-row' id='zpr-fn-$(($_.Name) -replace '[^a-zA-Z0-9]','_')'><span class='zip-progress-ip'>&#128196; $fn</span><span class='zip-progress-status waiting' id='zprs-fn-$(($_.Name) -replace '[^a-zA-Z0-9]','_')'>&#9675; Waiting</span></div>"
           }) -join "") +
         "</div>" +
       "</div>"
     })
-    <div id="groupsContainer">$groupHtml</div>
+    $(if ($files.Count -gt 0) {
+      "<div class='view-tabs'>" +
+      "<button class='view-tab active' onclick=`"switchView('ip', this)`">&#127760; Group by Sender IP</button>" +
+      "<button class='view-tab' onclick=`"switchView('fn', this)`">&#128196; Group by Filename</button>" +
+      "</div>"
+    })
+    <div class="view-panel active" id="view-ip">$groupHtmlByIp</div>
+    <div class="view-panel" id="view-fn">$groupHtmlByName</div>
   </div>
 </div>
 
 <script>
 var DL_PASSWORD = $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "'" + ($script:ServerSettings.Password -replace "'", "\\x27" -replace '\\', '\\\\') + "'" } else { 'null' });
 var SENDER_IPS = $senderIpsJson;
-var REGEX_ACTIVE = $regexActiveJs;
-var FILE_REGEX_GROUPS = $fileRegexGroupsJson;
+var FILENAME_GROUPS = $filenameGroupsJson;
 </script>
 <script>
-var _container = document.getElementById('groupsContainer');
-if (_container) { _container.setAttribute('data-ip-html', _container.innerHTML); }
 if (DL_PASSWORD) {
   document.querySelectorAll('a.dl-href').forEach(function(a) {
     a.href = a.getAttribute('href') + '&password=' + encodeURIComponent(DL_PASSWORD);
   });
-  // Re-snapshot after password links are injected
-  if (_container) { _container.setAttribute('data-ip-html', _container.innerHTML); }
+}
+function switchView(which, btn) {
+  document.querySelectorAll('.view-tab').forEach(function(t) { t.classList.remove('active'); });
+  btn.classList.add('active');
+  document.querySelectorAll('.view-panel').forEach(function(p) { p.classList.remove('active'); });
+  document.getElementById('view-' + which).classList.add('active');
 }
 function toggleGroup(id) {
   var body  = document.getElementById(id);
@@ -2112,7 +2015,7 @@ function labelHtml(wide, short) {
 function downloadAll(btn) {
   var groupId = btn.getAttribute('data-group');
   var body = document.getElementById(groupId);
-  var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
+  var files = JSON.parse(body.getAttribute('data-files'));
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
   btn.classList.add('busy');
   btn.textContent = '\u23f3 Downloading\u2026';
@@ -2136,34 +2039,34 @@ function downloadAll(btn) {
   }
   next();
 }
-function zipSelection(btn) {
-  var groupId = btn.getAttribute('data-group');
-  var body = document.getElementById(groupId);
-  var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
-  var labelRaw = (body.previousElementSibling
-    ? (body.previousElementSibling.querySelector('.ip-addr') || {}).textContent || 'selection'
-    : 'selection').trim();
+function zipAll(btn) {
+  var ip = btn.getAttribute('data-ip');
+  var filename = btn.getAttribute('data-filename');
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
-  var url = '/download/zip-selection?label=' + encodeURIComponent(labelRaw) + pw;
+  var url;
+  if (filename != null) {
+    url = '/download/zip?filename=' + encodeURIComponent(filename) + pw;
+  } else {
+    url = '/download/zip?ip=' + encodeURIComponent(ip) + pw;
+  }
   btn.classList.add('busy');
   btn.textContent = '\u23f3 Zipping\u2026';
-  fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(files)
-  })
+  fetch(url)
     .then(function(res) {
       if (!res.ok) throw new Error('Server returned ' + res.status);
       var cd = res.headers.get('Content-Disposition') || '';
       var match = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
-      var filename = match ? decodeURIComponent(match[1].replace(/"/g, '')) : 'selection.zip';
-      return res.blob().then(function(blob) { return { blob: blob, filename: filename }; });
+      var fname = match ? decodeURIComponent(match[1].replace(/"/g, '')) : 'files.zip';
+      return res.blob().then(function(blob) { return { blob: blob, filename: fname }; });
     })
     .then(function(r) {
       var url = URL.createObjectURL(r.blob);
       var a = document.createElement('a');
-      a.href = url; a.download = r.filename;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      a.href = url;
+      a.download = r.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
       setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
     })
     .catch(function(err) { alert('Zip failed: ' + err.message); })
@@ -2181,10 +2084,9 @@ function filenameFromDisposition(header, fallback) {
   return match ? decodeURIComponent(match[1].replace(/"/g, '')) : fallback;
 }
 async function downloadEverything(btn) {
-  if (!SENDER_IPS.length) return;
-  var pw       = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
-  var pwQuery  = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '?password=' + encodeURIComponent(DL_PASSWORD) : '';
-  var byRegex  = REGEX_ACTIVE && document.getElementById('groupbyCheck') && document.getElementById('groupbyCheck').checked;
+  var totalGroups = SENDER_IPS.length + FILENAME_GROUPS.length;
+  if (!totalGroups) return;
+  var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
 
   btn.disabled = true;
   document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.add('busy'); });
@@ -2194,185 +2096,79 @@ async function downloadEverything(btn) {
   var progressFill  = document.getElementById('zipProgressFill');
   progressBar.classList.add('visible');
 
-  function safeId(s) { return s.replace(/[^a-zA-Z0-9]/g, '_'); }
-  function setStatus(s, cls, html) {
-    var el = document.getElementById('zprs-' + safeId(s));
+  function safeId(prefix, name) { return prefix + '_' + name.replace(/[^a-zA-Z0-9]/g, '_'); }
+  function setStatus(prefix, name, cls, html) {
+    var el = document.getElementById('zprs-' + safeId(prefix, name));
     if (!el) return;
     el.className = 'zip-progress-status ' + cls;
     el.innerHTML = html;
   }
 
-  if (!byRegex) {
-    // ── IP mode: warm per-sender zips, then fetch zip-all ──────────────────
-    var done = 0;
-    for (var i = 0; i < SENDER_IPS.length; i++) {
-      var ip = SENDER_IPS[i];
-      setStatus(ip, 'zipping', '&#9881; Zipping&hellip;');
-      try {
-        var res = await fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw);
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        await res.blob();
-        done++;
-        setStatus(ip, 'done', '&#10003; Done');
-      } catch (err) {
-        done++;
-        setStatus(ip, 'error', '&#10007; Failed');
-      }
-      progressLabel.textContent = done + ' / ' + SENDER_IPS.length;
-      progressFill.style.width = Math.round(done / SENDER_IPS.length * 90) + '%';
-    }
+  var done = 0;
+
+  // Step 1: zip all IP groups
+  for (var i = 0; i < SENDER_IPS.length; i++) {
+    var ip = SENDER_IPS[i];
+    setStatus('ip', ip, 'zipping', '&#9881; Zipping&hellip;');
     try {
-      progressLabel.textContent = 'Packaging all\u2026';
-      var res = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
-      if (!res.ok) throw new Error('Server returned ' + res.status);
-      var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-senders.zip');
-      var blob = await res.blob();
-      progressFill.style.width = '100%';
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a'); a.href = url; a.download = filename;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+      var res = await fetch('/download/zip?ip=' + encodeURIComponent(ip) + pw);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      await res.blob();
+      setStatus('ip', ip, 'done', '&#10003; Done');
     } catch (err) {
-      alert('Download Everything failed: ' + err.message);
+      setStatus('ip', ip, 'error', '&#10007; Failed');
     }
-  } else {
-    // ── Regex mode: collect all visible groups, warm each selection zip, then build mega-zip ─
-    var groups = [];
-    document.querySelectorAll('#groupsContainer .ip-body[data-filelist]').forEach(function(body) {
-      var lbl = (body.previousElementSibling
-        ? (body.previousElementSibling.querySelector('.ip-addr') || {}).textContent || 'group'
-        : 'group').trim();
-      var files = body.getAttribute('data-filelist').split(' ').filter(Boolean);
-      if (files.length) groups.push({ label: lbl, files: files });
-    });
-    progressLabel.textContent = '0 / ' + groups.length;
-    var done = 0;
-    // Warm each group's selection zip first
-    for (var gi = 0; gi < groups.length; gi++) {
-      var grp = groups[gi];
-      setStatus(grp.label, 'zipping', '&#9881; Zipping&hellip;');
-      try {
-        var res = await fetch('/download/zip-selection?label=' + encodeURIComponent(grp.label) + (pwQuery ? '&' + pwQuery.substring(1) : ''), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(grp.files)
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        await res.blob();
-        done++;
-        setStatus(grp.label, 'done', '&#10003; Done');
-      } catch (err) {
-        done++;
-        setStatus(grp.label, 'error', '&#10007; Failed');
-      }
-      progressLabel.textContent = done + ' / ' + groups.length;
-      progressFill.style.width = Math.round(done / groups.length * 90) + '%';
-    }
-    // Now assemble the mega-zip from all group selection zips
+    done++;
+    progressLabel.textContent = done + ' / ' + totalGroups;
+    progressFill.style.width = Math.round(done / totalGroups * 90) + '%';
+  }
+
+  // Step 2: zip all filename groups
+  for (var j = 0; j < FILENAME_GROUPS.length; j++) {
+    var fn = FILENAME_GROUPS[j];
+    setStatus('fn', fn, 'zipping', '&#9881; Zipping&hellip;');
     try {
-      progressLabel.textContent = 'Packaging all\u2026';
-      var res = await fetch('/download/zip-all-groups' + pwQuery, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(groups)
-      });
-      if (!res.ok) throw new Error('Server returned ' + res.status);
-      var filename = filenameFromDisposition(res.headers.get('Content-Disposition'), 'all-groups.zip');
-      var blob = await res.blob();
-      progressFill.style.width = '100%';
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a'); a.href = url; a.download = filename;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+      var res2 = await fetch('/download/zip?filename=' + encodeURIComponent(fn) + pw);
+      if (!res2.ok) throw new Error('HTTP ' + res2.status);
+      await res2.blob();
+      setStatus('fn', fn, 'done', '&#10003; Done');
     } catch (err) {
-      alert('Download Everything failed: ' + err.message);
+      setStatus('fn', fn, 'error', '&#10007; Failed');
     }
+    done++;
+    progressLabel.textContent = done + ' / ' + totalGroups;
+    progressFill.style.width = Math.round(done / totalGroups * 90) + '%';
   }
 
-  setTimeout(function() {
-    btn.disabled = false;
-    document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.remove('busy'); });
-    progressBar.classList.remove('visible');
-    progressFill.style.width = '0%';
-    SENDER_IPS.forEach(function(ip) { setStatus(ip, 'waiting', '&#9675; Waiting'); });
-    progressLabel.textContent = '0 / ' + SENDER_IPS.length;
-  }, 1400);
-}
-function onGroupByChange(cb) {
-  var label = document.getElementById('groupbyToggle');
-  if (label) label.classList.toggle('active', cb.checked);
-  rebuildGroups(cb.checked);
-}
-function rebuildGroups(byRegex) {
-  var container = document.getElementById('groupsContainer');
-  if (!container) return;
-
-  if (!byRegex) {
-    // Restore original IP-grouped HTML
-    container.innerHTML = container.getAttribute('data-ip-html');
-    if (DL_PASSWORD) {
-      container.querySelectorAll('a.dl-href').forEach(function(a) {
-        if (a.getAttribute('href').indexOf('password=') === -1)
-          a.href = a.getAttribute('href') + '&password=' + encodeURIComponent(DL_PASSWORD);
-      });
-    }
-    return;
+  // Step 3: fetch the mega zip of all IP-sender zips
+  try {
+    progressLabel.textContent = 'Packaging all\u2026';
+    var res3 = await fetch('/download/zip-all' + (pw ? '?' + pw.substring(1) : ''));
+    if (!res3.ok) throw new Error('Server returned ' + res3.status);
+    var filename = filenameFromDisposition(res3.headers.get('Content-Disposition'), 'all-senders.zip');
+    var blob = await res3.blob();
+    progressFill.style.width = '100%';
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+  } catch (err) {
+    alert('Download Everything failed: ' + err.message);
+  } finally {
+    setTimeout(function() {
+      btn.disabled = false;
+      document.querySelectorAll('.dl-all-btn, .zip-all-btn').forEach(function(b) { b.classList.remove('busy'); });
+      progressBar.classList.remove('visible');
+      progressFill.style.width = '0%';
+      SENDER_IPS.forEach(function(ip) { setStatus('ip', ip, 'waiting', '&#9675; Waiting'); });
+      FILENAME_GROUPS.forEach(function(fn) { setStatus('fn', fn, 'waiting', '&#9675; Waiting'); });
+      progressLabel.textContent = '0 / ' + totalGroups;
+    }, 1400);
   }
-
-  // Collect all rows from all IP groups
-  var allRows = [];
-  container.querySelectorAll('.ip-body tr[data-enc]').forEach(function(tr) {
-    allRows.push(tr.cloneNode(true));
-  });
-
-  // Bucket by regex group label
-  var buckets = {};
-  var order = [];
-  allRows.forEach(function(tr) {
-    var enc = tr.getAttribute('data-enc');
-    var lbl = (FILE_REGEX_GROUPS && FILE_REGEX_GROUPS[enc]) || 'Other';
-    if (!buckets[lbl]) { buckets[lbl] = []; order.push(lbl); }
-    buckets[lbl].push(tr);
-  });
-  order.sort();
-
-  var html = '';
-  order.forEach(function(lbl) {
-    var rows = buckets[lbl];
-    var safeId = 'rgrp-' + lbl.replace(/[^a-zA-Z0-9]/g, '_');
-    var encListSpace = rows.map(function(tr) { return tr.getAttribute('data-enc'); }).join(' ');
-    var bodyRows = rows.map(function(tr) { return tr.outerHTML; }).join('');
-    html +=
-      '<div class="ip-group">' +
-        '<div class="ip-header-row">' +
-          '<button class="ip-header" onclick="toggleGroup(\'' + safeId + '\')" aria-expanded="true">' +
-            '<span class="ip-icon">&#127381;</span>' +
-            '<span class="ip-addr">' + escHtml(lbl) + '</span>' +
-            '<span class="ip-count badge">' + rows.length + ' file' + (rows.length !== 1 ? 's' : '') + '</span>' +
-            '<span class="ip-chevron" id="chev-' + safeId + '">&#9650;</span>' +
-          '</button>' +
-          '<button class="dl-all-btn" onclick="downloadAll(this)" data-group="' + safeId + '" title="Download all files in this group">&#9196; Download All</button>' +
-          '<button class="zip-all-btn" onclick="zipSelection(this)" data-group="' + safeId + '" title="Zip and download all files in this group">&#128230; Zip &amp; Download</button>' +
-        '</div>' +
-        '<div class="ip-body" id="' + safeId + '" data-filelist="' + escHtml(encListSpace) + '">' +
-          '<table>' +
-            '<colgroup><col class="col-file"><col class="col-size"><col class="col-date"><col class="col-action"></colgroup>' +
-            '<thead><tr><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>' +
-            '<tbody>' + bodyRows + '</tbody>' +
-          '</table>' +
-        '</div>' +
-      '</div>';
-  });
-  container.innerHTML = html;
-  if (DL_PASSWORD) {
-    container.querySelectorAll('a.dl-href').forEach(function(a) {
-      if (a.getAttribute('href').indexOf('password=') === -1)
-        a.href = a.getAttribute('href') + '&password=' + encodeURIComponent(DL_PASSWORD);
-    });
-  }
-}
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function copyUrl(btn) {
   var name = btn.getAttribute('data-name');
@@ -3660,7 +3456,7 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip?ip=... ─────────────────────────────────────────
+        # ── GET /download/zip?ip=...  OR  /download/zip?filename=... ────────
         elseif ($path -eq "/download/zip") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3668,70 +3464,24 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             if (-not $authorized) {
                 Send-Redirect $ctx "/download"
             } else {
-                $senderIp = $req.QueryString["ip"]
-                $zipFiles = @(Get-UploadableFiles | Where-Object { (Get-SenderIpFromFileName $_.Name) -eq $senderIp })
-                if ($zipFiles.Count -eq 0) {
-                    Send-Response $ctx "<h2>404 — No files found for that sender</h2>" -status 404
-                } else {
-                    $paths = Get-OrBuildSenderZip $senderIp $zipFiles
-                    Send-FileStreamResponse $ctx $paths.ZipPath 'application/zip' $paths.DisplayName
-                }
-            }
-        }
-
-        # ── POST /download/zip-selection?label=... ───────────────────────────
-        # Body: JSON array of URI-encoded filenames. Returns a cached zip of exactly those files.
-        # Optional ?label=<name> sets the downloaded zip filename to selection-<name>.zip
-        elseif ($path -eq "/download/zip-selection" -and $method -eq "POST") {
-            $token     = Get-CookieToken $req
-            $quickpass = $req.QueryString["password"]
-            $authorized = [string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token) -or ($quickpass -eq $script:ServerSettings.Password)
-            if (-not $authorized) {
-                Send-Response $ctx '{"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
-            } else {
-                $reader   = New-Object System.IO.StreamReader($req.InputStream, [System.Text.Encoding]::UTF8)
-                $body     = $reader.ReadToEnd()
-                $nameList = $null
-                try { $nameList = @($body | ConvertFrom-Json) } catch {}
-                if ($null -eq $nameList -or $nameList.Count -eq 0) {
-                    Send-Response $ctx "<h2>400 — No files specified</h2>" -status 400
-                } else {
-                    $label = $req.QueryString["label"]
-                    if ([string]::IsNullOrWhiteSpace($label)) { $label = "selection" }
-                    $paths = Get-OrBuildSelectionZip $nameList $label
-                    if ($null -eq $paths) {
-                        Send-Response $ctx "<h2>404 — No matching files found</h2>" -status 404
+                $senderIp    = $req.QueryString["ip"]
+                $filenameKey = $req.QueryString["filename"]
+                if (-not [string]::IsNullOrEmpty($filenameKey)) {
+                    # Group by display filename
+                    $zipFiles = @(Get-UploadableFiles | Where-Object { (Get-DisplayNameFromFileName $_.Name) -eq $filenameKey })
+                    if ($zipFiles.Count -eq 0) {
+                        Send-Response $ctx "<h2>404 — No files found for that filename group</h2>" -status 404
                     } else {
+                        $paths = Get-OrBuildFilenameZip $filenameKey $zipFiles
                         Send-FileStreamResponse $ctx $paths.ZipPath 'application/zip' $paths.DisplayName
                     }
-                }
-            }
-        }
-
-        # ── POST /download/zip-all-groups ─────────────────────────────────────
-        # Body: JSON array of { label: string, files: string[] }.
-        # Builds each group's selection zip then assembles a mega-zip of all group zips.
-        elseif ($path -eq "/download/zip-all-groups" -and $method -eq "POST") {
-            $token     = Get-CookieToken $req
-            $quickpass = $req.QueryString["password"]
-            $authorized = [string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token) -or ($quickpass -eq $script:ServerSettings.Password)
-            if (-not $authorized) {
-                Send-Response $ctx '{"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
-            } else {
-                $reader    = New-Object System.IO.StreamReader($req.InputStream, [System.Text.Encoding]::UTF8)
-                $body      = $reader.ReadToEnd()
-                $groupList = $null
-                try { $groupList = @($body | ConvertFrom-Json) } catch {}
-                if ($null -eq $groupList -or $groupList.Count -eq 0) {
-                    Send-Response $ctx "<h2>400 — No groups specified</h2>" -status 400
                 } else {
-                    $groups = @($groupList | ForEach-Object {
-                        @{ Label = [string]$_.label; FileNames = @($_.files | ForEach-Object { [string]$_ }) }
-                    })
-                    $paths = Get-OrBuildAllGroupsZip $groups
-                    if ($null -eq $paths) {
-                        Send-Response $ctx "<h2>404 — No matching files found</h2>" -status 404
+                    # Group by sender IP (original behaviour)
+                    $zipFiles = @(Get-UploadableFiles | Where-Object { (Get-SenderIpFromFileName $_.Name) -eq $senderIp })
+                    if ($zipFiles.Count -eq 0) {
+                        Send-Response $ctx "<h2>404 — No files found for that sender</h2>" -status 404
                     } else {
+                        $paths = Get-OrBuildSenderZip $senderIp $zipFiles
                         Send-FileStreamResponse $ctx $paths.ZipPath 'application/zip' $paths.DisplayName
                     }
                 }
@@ -3778,14 +3528,13 @@ function New-RequestRunspacePool {
         'Find-SevenZipExe',
         'Build-ZipCache',
         'Save-ZipCacheManifest',
+        'Get-DisplayNameFromFileName',
+        'Get-FilenameZipCachePaths',
+        'Get-OrBuildFilenameZip',
         'Get-AllSendersZipFingerprint',
         'Get-AllSendersZipCachePaths',
         'Get-OrBuildSenderZip',
         'Get-OrBuildAllSendersZip',
-        'Get-SelectionZipCachePaths',
-        'Get-OrBuildSelectionZip',
-        'Get-AllGroupsZipCachePaths',
-        'Get-OrBuildAllGroupsZip',
         'Send-FileStreamResponse',
         'Send-BytesResponse',
         'Get-ServerSettingsObject',
