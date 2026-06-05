@@ -570,7 +570,7 @@ function Get-OrBuildMegaZip([string]$mode, $allFiles) {
 
     # Collect the constituent group zips (building/caching each one first)
     $groupZips = [System.Collections.Generic.List[hashtable]]::new()
-    if ($mode -eq 'filename') {
+    if ($mode -eq 'fn') {
         $groups = @($allFiles | Group-Object { Get-DisplayNameFromFileName $_.Name } | Sort-Object Name)
         foreach ($g in $groups) {
             $gPaths = Get-OrBuildFilenameZip ([string]$g.Name) @($g.Group)
