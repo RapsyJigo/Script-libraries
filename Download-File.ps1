@@ -10,6 +10,7 @@
 # EXAMPLES:
 #   .\Download-File.ps1 -Url "https://example.com/report.pdf" -Destination "C:\Downloads"
 #   .\Download-File.ps1 -Url "https://example.com/archive.zip" -Destination "."
+#   .\Download-File.ps1 -Url "https://example.com/download?name=archive.zip" -Destination "."
 
 [CmdletBinding()]
 param (
@@ -20,17 +21,59 @@ param (
     [string]$Destination
 )
 
-# --- Resolve filename from URL ---
-try {
-    $uri      = [System.Uri]$Url
-    $fileName = [System.IO.Path]::GetFileName($uri.LocalPath)
+# --- Resolve filename ---
+# Priority: 1) Content-Disposition header  2) URL path segment
+function Resolve-Filename {
+    param([string]$Url)
 
-    if ([string]::IsNullOrWhiteSpace($fileName)) {
-        Write-Error "Could not determine a filename from the URL: '$Url'"
-        exit 1
+    $fileName = $null
+
+    # Send a HEAD request to read headers without downloading the body
+    try {
+        $req                   = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method            = 'HEAD'
+        $req.AllowAutoRedirect = $true
+        $res                   = $req.GetResponse()
+
+        # 1) Content-Disposition: attachment; filename="something.zip"
+        $cd = $res.Headers['Content-Disposition']
+        if ($cd -match 'filename\*=UTF-8''''(.+)') {
+            $fileName = [System.Uri]::UnescapeDataString($Matches[1].Trim('"'))
+        } elseif ($cd -match 'filename=["]?([^";]+)["]?') {
+            $fileName = $Matches[1].Trim()
+        }
+
+        # 2) Fallback: last path segment of the URL (ignores query string)
+        if ([string]::IsNullOrWhiteSpace($fileName)) {
+            $uri     = [System.Uri]$Url
+            $segment = [System.IO.Path]::GetFileName($uri.LocalPath)
+            if (-not [string]::IsNullOrWhiteSpace($segment) -and $segment -ne '/') {
+                $fileName = $segment
+            }
+        }
+
+        $res.Close()
+    } catch {
+        # HEAD not supported — fall back to URL path only
+        $uri     = [System.Uri]$Url
+        $segment = [System.IO.Path]::GetFileName($uri.LocalPath)
+        if (-not [string]::IsNullOrWhiteSpace($segment) -and $segment -ne '/') {
+            $fileName = $segment
+        }
     }
+
+    return $fileName
+}
+
+try {
+    $fileName = Resolve-Filename -Url $Url
 } catch {
-    Write-Error "Invalid URL: '$Url'. $_"
+    Write-Error "Could not resolve filename: $_"
+    exit 1
+}
+
+if ([string]::IsNullOrWhiteSpace($fileName)) {
+    Write-Error "Could not determine filename from URL or response headers. Try renaming the file on the server or setting a Content-Disposition header."
     exit 1
 }
 
