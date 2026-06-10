@@ -193,19 +193,17 @@ $script:ServerSettings = @{
     UploadWindowEnabled  = ($null -ne $parsedWindowStart -or $null -ne $parsedWindowEnd)
     UploadWindowStart    = $parsedWindowStart
     UploadWindowEnd      = $parsedWindowEnd
+    Port                 = $Port
+    PrivateIP            = ""
 }
 
 # ── Self-Elevation ───────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-ServerLog "Not running as Administrator — relaunching elevated..." -Level Warn
-    $url     = 'https://raw.githubusercontent.com/RapsyJigo/Script-libraries/refs/heads/main/Upload-Download-Server.ps1'
-    $escapedRegex = $UploadFileRegex -replace "'", "''"
-    $escapedWhitelist = $UploadIPWhitelist -replace "'", "''"
-    $escapedWinStart = $UploadWindowStart -replace "'", "''"
-    $escapedWinEnd = $UploadWindowEnd -replace "'", "''"
-    $argList = "-NoExit -ExecutionPolicy Bypass -Command `"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '$url').Content)) -Port $Port -UploadFolder '$resolvedUploadFolder' -Password '$Password' -UploadFileRegex '$escapedRegex' -MaxUploadSize $MaxUploadSize -UploadIPWhitelist '$escapedWhitelist' -UploadWindowStart '$escapedWinStart' -UploadWindowEnd '$escapedWinEnd'`""
-    Start-Process powershell -Verb RunAs -ArgumentList $argList
+    Write-ServerLog "Not running as Administrator" -Level Warn
+    Write-ServerLog "Please restart as administrator"
+    Write-ServerLog "Auto closing in 30 seconds"
+    Start-Sleep -Seconds 30
     exit
 }
 
@@ -2062,6 +2060,8 @@ function Get-DownloadPage {
 var DL_PASSWORD = $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "'" + ($script:ServerSettings.Password -replace "'", "\\x27" -replace '\\', '\\\\') + "'" } else { 'null' });
 var SENDER_IPS = $senderIpsJson;
 var FILENAME_GROUPS = $filenameGroupsJson;
+var PRIVATE_IP = '$($script:ServerSettings.PrivateIP)';
+var SERVER_PORT = $($script:ServerSettings.Port);
 </script>
 <script>
 if (DL_PASSWORD) {
@@ -2249,7 +2249,8 @@ async function downloadEverything(btn) {
 function copyUrl(btn) {
   var name = btn.getAttribute('data-name');
   var pw = (typeof DL_PASSWORD !== 'undefined' && DL_PASSWORD) ? '&password=' + encodeURIComponent(DL_PASSWORD) : '';
-  var url = window.location.origin + '/download/file?name=' + name + pw;
+  var origin = (typeof PRIVATE_IP !== 'undefined' && PRIVATE_IP) ? 'http://' + PRIVATE_IP + ':' + SERVER_PORT : window.location.origin;
+  var url = origin + '/download/file?name=' + name + pw;
   navigator.clipboard.writeText(url).then(function() {
     var orig = btn.innerHTML;
     btn.innerHTML = '&#10003; Copied!';
@@ -3227,6 +3228,7 @@ try {
 }
 
 $privateIP = (Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne "Disconnected"}).IPv4Address.IPAddress
+$script:ServerSettings.PrivateIP = if ($privateIP -is [array]) { $privateIP[0] } else { [string]$privateIP }
 $publicIP = "No Internet"
 try {
   $publicIP  = (Invoke-WebRequest ifconfig.me/ip -UseBasicParsing).Content.Trim()
