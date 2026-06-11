@@ -1,20 +1,20 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Simple HTTP File Server - Upload & Password-Protected Download
+  Very not simple HTTP File Server - Upload & Password-Protected Download for exams
 
 .DESCRIPTION
-    Hosts web pages:
-      /         -> Upload page (anyone can upload files)
-      /download -> Password-protected download page
-      /admin    -> Localhost-only settings (live-updatable)
+  Hosts web pages:
+    /         -> Upload page (anyone can upload files)
+    /download -> Password-protected download page
+    /admin    -> Localhost-only settings (live-updatable)
 
 .PARAMETER Port
-    TCP port to listen on. Default: 80
+  TCP port to listen on. Default: 80
 
 .PARAMETER UploadFolder
-    Folder where uploaded files are saved. Default: .\uploads
-    Can also be changed live on /admin (localhost only).
+  Folder where uploaded files are saved. Default: .\uploads
+  Can also be changed live on /admin (localhost only).
 
 .PARAMETER Password
     Password required to access the download page. Mandatory requested on load
@@ -39,10 +39,10 @@
   Can also be changed live on /admin (localhost only).
 
 .EXAMPLE
-    .\Upload-Download-Server.ps1
-    .\Upload-Download-Server.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
-    .\Upload-Download-Server.ps1 -UploadFileRegex '\.(pdf|docx)$'
-    .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00"
+  .\Upload-Download-Server.ps1
+  .\Upload-Download-Server.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
+  .\Upload-Download-Server.ps1 -UploadFileRegex '\.(pdf|docx)$'
+  .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00"
 #>
 param(
     [Parameter(Mandatory = $false, HelpMessage = "The port on which the server will be opened. Must have no other processes using this port.")]
