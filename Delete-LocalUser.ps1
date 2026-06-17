@@ -23,7 +23,9 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Blacklist: accounts that must never be deleted ───────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Blacklist: accounts that must never be deleted
+# ────────────────────────────────────────────────────────────────────────
 $Blacklist = @(
     'Administrator',
     'DefaultAccount',
@@ -34,7 +36,9 @@ $Blacklist = @(
     'NETWORK SERVICE'
 )
 
-# ── 1. Self-elevate if not running as Administrator ──────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 1. Self-elevate if not running as Administrator
+# ────────────────────────────────────────────────────────────────────────
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Username `"$Username`""
@@ -43,13 +47,17 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit $LASTEXITCODE
 }
 
-# ── 2. Blacklist check ───────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 2. Blacklist check
+# ────────────────────────────────────────────────────────────────────────
 if ($Blacklist -contains $Username) {
     Write-Error "Username '$Username' is on the protected blacklist. Deletion refused."
     exit 1
 }
 
-# ── 3. Verify the user exists locally ────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 3. Verify the user exists locally
+# ────────────────────────────────────────────────────────────────────────
 try {
     $localUser = Get-LocalUser -Name $Username
 } catch {
@@ -63,7 +71,9 @@ if ($localUser.SID.Value -match '-(500|501)$') {
     exit 1
 }
 
-# ── 4. Force log off ALL active user sessions ────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 4. Force log off ALL active user sessions
+# ────────────────────────────────────────────────────────────────────────
 try {
     $sessions = query session 2>$null |
         Select-String -Pattern "^\s*>?\s*\S+\s+\S+\s+(\d+)\s+(Active|Disc)" |
@@ -78,7 +88,9 @@ try {
     Write-Warning "Session logoff had an issue: $_"
 }
 
-# ── 5. Resolve the profile directory path ────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 5. Resolve the profile directory path
+# ────────────────────────────────────────────────────────────────────────
 $wmiProfile = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq $localUser.SID.Value }
 
 $ProfilePath = if ($wmiProfile) {
@@ -90,7 +102,9 @@ $ProfilePath = if ($wmiProfile) {
 
 $profileExists = Test-Path $ProfilePath
 
-# ── 6. Remove the local user account ─────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 6. Remove the local user account
+# ────────────────────────────────────────────────────────────────────────
 try {
     Remove-LocalUser -Name $Username
 } catch {
@@ -98,7 +112,9 @@ try {
     exit 1
 }
 
-# ── 7. Delete the profile directory ──────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 7. Delete the profile directory
+# ────────────────────────────────────────────────────────────────────────
 if ($profileExists) {
     try {
         $emptyDir = Join-Path $env:TEMP "EmptyDir_$(New-Guid)"
@@ -111,7 +127,9 @@ if ($profileExists) {
     }
 }
 
-# ── 8. Clean up WMI / registry profile entry ─────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 8. Clean up WMI / registry profile entry
+# ────────────────────────────────────────────────────────────────────────
 try {
     $wmiProfile = Get-CimInstance -ClassName Win32_UserProfile |
         Where-Object { $_.SID -eq $localUser.SID.Value }
@@ -120,6 +138,8 @@ try {
     Write-Warning "Could not remove WMI profile entry for '$Username': $_"
 }
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Done
+# ────────────────────────────────────────────────────────────────────────
 Write-Host "SUCCESS: User '$Username' and profile '$ProfilePath' removed."
 exit 0

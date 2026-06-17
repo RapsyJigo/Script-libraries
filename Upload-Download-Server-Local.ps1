@@ -75,7 +75,9 @@ param(
     [string] $UploadWindowEnd = ""
 )
 
-# ── Setup ────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Setup
+# ────────────────────────────────────────────────────────────────────────
 $ErrorActionPreference = "Stop"
 
 function Write-ServerLog {
@@ -195,7 +197,9 @@ $script:ServerSettings = @{
     UploadWindowEnd      = $parsedWindowEnd
 }
 
-# ── Self-Elevation ───────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Self-Elevation
+# ────────────────────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-ServerLog "Not running as Administrator" -Level Warn
@@ -883,7 +887,9 @@ function Set-ServerSettingsFromJson([string]$json, [ref]$errorMsg) {
     return $true
 }
 
-# ── HTML Templates ───────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> HTML Templates
+# ────────────────────────────────────────────────────────────────────────
 
 $CSS_SHARED = @'
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap');
@@ -1008,7 +1014,9 @@ $CSS_SHARED = @'
   }
 '@
 
-# ── Upload Page ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Upload Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlocked = $false, [string]$clientIP = "") {
     $msgHtml = ""
     if ($msg) {
@@ -1038,7 +1046,9 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
 "@
     }
 
-    # ── IP-blocked banner (shown instead of the normal message area) ──────────
+# ────────────────────────────────────────────────────────────────────────
+# >> IP-blocked banner (shown instead of the normal message area)
+# ────────────────────────────────────────────────────────────────────────
     $blockedBannerHtml = ""
     $blockedJs         = "false"
     if ($ipBlocked) {
@@ -1698,7 +1708,9 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
 "@
 }
 
-# ── Login Page ───────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Login Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-LoginPage([bool]$failed = $false) {
     $errHtml = if ($failed) { "<div class='msg err'>&#10007;&nbsp; Incorrect password. Try again.</div>" } else { "" }
     return @"
@@ -1724,7 +1736,9 @@ function Get-LoginPage([bool]$failed = $false) {
 "@
 }
 
-# ── Download Page ────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Download Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-DownloadPage {
     $files = @(Get-UploadableFiles | Sort-Object LastWriteTime -Descending)
 
@@ -2260,7 +2274,9 @@ function copyUrl(btn) {
 "@
 }
 
-# ── Admin Page ───────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Admin Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     $regexVal   = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFileRegex)
     $folderVal  = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFolder)
@@ -2875,7 +2891,9 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
 "@
 }
 
-# ── Multipart Parser ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Multipart Parser
+# ────────────────────────────────────────────────────────────────────────
 #
 # Performance design
 # ──────────────────
@@ -2936,13 +2954,19 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
     $savedNames   = [System.Collections.Generic.List[string]]::new()
     $bodyCounter  = @{ Value = 0L }
 
-    # ── Pending queue: O(1) Enqueue / Dequeue (replaces List[byte].RemoveAt(0))
+# ────────────────────────────────────────────────────────────────────────
+# >> Pending queue: O(1) Enqueue / Dequeue (replaces List[byte].RemoveAt(0))
+# ────────────────────────────────────────────────────────────────────────
     $pending = [System.Collections.Generic.Queue[byte]]::new(512)
 
-    # ── Wrap the raw InputStream in a BufferedStream for large-block reads ────
+# ────────────────────────────────────────────────────────────────────────
+# >> Wrap the raw InputStream in a BufferedStream for large-block reads
+# ────────────────────────────────────────────────────────────────────────
     $bufferedInput = [System.IO.BufferedStream]::new($req.InputStream, 262144)  # 256 KB buffer
 
-    # ── Single-byte refill buffer (avoids ReadByte() boxing overhead) ─────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Single-byte refill buffer (avoids ReadByte() boxing overhead)
+# ────────────────────────────────────────────────────────────────────────
     [byte[]]$oneByteBuf = New-Object byte[] 1
 
     function Add-BodyBytes([long]$count) {
@@ -3018,7 +3042,9 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         }
     }
 
-    # ── Boyer-Moore-Horspool bad-character skip table ─────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Boyer-Moore-Horspool bad-character skip table
+# ────────────────────────────────────────────────────────────────────────
     # Typical skip per mismatch ≈ boundary length (~30-70 bytes) vs old O(1) advance.
     [int[]]$bmhSkip = New-Object int[] 256
     $patLen = $delimiterBytes.Length
@@ -3160,7 +3186,9 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
     return @{ Names = $savedNames; Error = $null }
 }
 
-# ── HTTP Server ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> HTTP Server
+# ────────────────────────────────────────────────────────────────────────
 function Add-ServerFirewallRule {
     try {
         $existing = Get-NetFirewallRule -DisplayName $script:FirewallRuleName -ErrorAction SilentlyContinue
@@ -3232,7 +3260,9 @@ try {
 
 
 
-# ── Check whether port is reachable from the internet ────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Check whether port is reachable from the internet
+# ────────────────────────────────────────────────────────────────────────
 $portOpen = $false
 try {
     $probe    = Invoke-WebRequest "https://portchecker.io/api/me/${port}" -UseBasicParsing -TimeoutSec 10
@@ -3316,7 +3346,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
 
 
     try {
-        # ── GET / ────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /
+# ────────────────────────────────────────────────────────────────────────
         if ($path -eq "" -or $path -eq "/") {
             $ok = $req.QueryString["ok"]
             $err = $req.QueryString["err"]
@@ -3331,7 +3363,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             Send-Response $ctx (Get-UploadPage -msg $msg -isError $isErr -ipBlocked $blocked -clientIP $visitorIP)
         }
 
-        # ── POST /upload ─────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /upload
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/upload" -and $method -eq "POST") {
             $uploaderIP = $req.RemoteEndPoint.Address.ToString()
             Write-ServerLog "POST /upload (form) from $uploaderIP" -Level Info
@@ -3358,7 +3392,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /upload-chunk (single file per XHR, used by progress uploader)
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /upload-chunk (single file per XHR, used by progress uploader)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/upload-chunk" -and $method -eq "POST") {
             $uploaderIP = $req.RemoteEndPoint.Address.ToString()
             Write-ServerLog "POST /upload-chunk from $uploaderIP" -Level Info
@@ -3393,7 +3429,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /admin (localhost only) ──────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /admin (localhost only)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin") {
             if (-not (Test-IsLocalRequest $req)) {
                 Write-ServerLog "GET /admin denied — not localhost ($($req.RemoteEndPoint.Address))" -Level Warn
@@ -3404,7 +3442,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /admin/settings (localhost only) ─────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /admin/settings (localhost only)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin/settings" -and $method -eq "GET") {
             if (-not (Test-IsLocalRequest $req)) {
                 Send-Response $ctx '{"ok":false,"error":"Forbidden"}' -status 403 -contentType "application/json; charset=utf-8"
@@ -3413,7 +3453,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /admin/settings (localhost only) ────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /admin/settings (localhost only)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin/settings" -and $method -eq "POST") {
             if (-not (Test-IsLocalRequest $req)) {
                 Send-Response $ctx '{"ok":false,"error":"Forbidden"}' -status 403 -contentType "application/json; charset=utf-8"
@@ -3445,7 +3487,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download ────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download") {
             $token = Get-CookieToken $req
             if ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token)) {
@@ -3455,7 +3499,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /download/login ─────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /download/login
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/login" -and $method -eq "POST") {
             if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) {
                 Send-Redirect $ctx "/download"
@@ -3478,7 +3524,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/logout ─────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/logout
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/logout") {
             $token = Get-CookieToken $req
             if ($token) {
@@ -3489,7 +3537,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             Send-Redirect $ctx "/download"
         }
 
-        # ── GET /download/file?name=... ──────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/file?name=...
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/file") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3510,7 +3560,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip-all ────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/zip-all
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/zip-all") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3528,7 +3580,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip?ip=...  OR  /download/zip?filename=... ────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/zip?ip=...  OR  /download/zip?filename=...
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/zip") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3560,7 +3614,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip-mega?mode=ip|filename ──────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/zip-mega?mode=ip|filename
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/zip-mega") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3580,7 +3636,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── 404 ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 404
+# ────────────────────────────────────────────────────────────────────────
         else {
             Write-ServerLog "404 Not Found: $method $path" -Level Warn
             Send-Response $ctx "<h2 style='font-family:sans-serif;color:#888'>404 — Not Found</h2>" -status 404

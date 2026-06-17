@@ -20,7 +20,9 @@ param (
     [string]$Destination
 )
 
-# ── Resolve filename from URL ─────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Resolve filename from URL
+# ────────────────────────────────────────────────────────────────────────
 try {
     $uri      = [System.Uri]$Url
     $fileName = [System.IO.Path]::GetFileName($uri.LocalPath)
@@ -34,14 +36,18 @@ try {
     exit 1
 }
  
-# ── Ensure destination folder exists ─────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Ensure destination folder exists
+# ────────────────────────────────────────────────────────────────────────
 if (-not (Test-Path -Path $Destination -PathType Container)) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 }
  
 $outputPath = Join-Path -Path $Destination -ChildPath $fileName
  
-# ── Download ─────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Comment
+# ────────────────────────────────────────────────────────────────────────
 try {
     $client = [System.Net.WebClient]::new()
     $client.DownloadFile($Url, $outputPath)
@@ -50,8 +56,11 @@ try {
     Write-Error "Download error: $_"
     exit 1
 }
- 
-# ── Verify ───────────────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────────────────
+# >> Verify
+# ────────────────────────────────────────────────────────────────────────
+
 if (Test-Path -Path $outputPath) {
     $size = (Get-Item $outputPath).Length
     Write-Host "Done! '$fileName' saved ($size bytes) at '$Destination'." -ForegroundColor Green

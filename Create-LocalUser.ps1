@@ -43,10 +43,14 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Main try/catch — single write to console on exit ─────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Main try/catch — single write to console on exit
+# ────────────────────────────────────────────────────────────────────────
 try {
 
-    # ── 1. Build New-LocalUser parameter set ─────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 1. Build New-LocalUser parameter set
+# ────────────────────────────────────────────────────────────────────────
     $newUserParams = @{
         Name                     = $Username
         PasswordNeverExpires     = $true
@@ -62,25 +66,33 @@ try {
         $passwordMode = "password set"
     }
 
-    # ── 2. Abort if user already exists ──────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 2. Abort if user already exists
+# ────────────────────────────────────────────────────────────────────────
     if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
         throw "User '$Username' already exists."
     }
 
     New-LocalUser @newUserParams | Out-Null
 
-    # ── 3. Validate group and add user membership ─────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 3. Validate group and add user membership
+# ────────────────────────────────────────────────────────────────────────
     if (-not (Get-LocalGroup -Name $Group -ErrorAction SilentlyContinue)) {
         throw "Group '$Group' does not exist on this machine."
     }
 
     Add-LocalGroupMember -Group $Group -Member $Username
 
-    # ── 4. Single success output ──────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 4. Single success output
+# ────────────────────────────────────────────────────────────────────────
     Write-Output "SUCCESS: User '$Username' created ($passwordMode), added to '$Group'."
 
 } catch {
-    # ── Single error output ───────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Single error output
+# ────────────────────────────────────────────────────────────────────────
     Write-Error "ERROR: $_"
     exit 1
 }
