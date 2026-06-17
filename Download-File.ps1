@@ -21,8 +21,9 @@ param (
     [string]$Destination
 )
 
-# --- Resolve filename ---
-# Priority: 1) Content-Disposition header  2) URL path segment
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Resolve filename
+# ─────────────────────────────────────────────────────────────────────────────
 function Resolve-Filename {
     param([string]$Url)
 
@@ -87,7 +88,7 @@ if (-not (Test-Path -Path $Destination -PathType Container)) {
 $outputPath = Join-Path -Path $Destination -ChildPath $fileName
  
 # ────────────────────────────────────────────────────────────────────────
-# >> Comment
+# >> Download the file
 # ────────────────────────────────────────────────────────────────────────
 try {
     $client = [System.Net.WebClient]::new()
@@ -111,7 +112,9 @@ if (Test-Path -Path $outputPath) {
 }
 
 
-# --- Unzip if the downloaded file is an archive ---
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Unzip if it is a zip archive
+# ─────────────────────────────────────────────────────────────────────────────
 $sevenZipExtensions = @('.7z', '.rar', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz', '.gz', '.bz2', '.xz', '.iso', '.zip')
 $zipOnlyExtensions  = @('.zip')
 

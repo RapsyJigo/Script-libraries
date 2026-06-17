@@ -47,7 +47,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Helpers
+# ────────────────────────────────────────────────────────────────────────
 
 function Write-Log {
     param([string]$Message, [ValidateSet('Info','Ok','Warn','Error')][string]$Level = 'Info')
@@ -61,7 +63,9 @@ function Write-Log {
     Write-Host "[$ts] $Message" -ForegroundColor $color
 }
 
-# ── Validate inputs ───────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Validate inputs
+# ────────────────────────────────────────────────────────────────────────
 
 # Normalise server URL (strip trailing slash)
 $ServerUrl = $ServerUrl.TrimEnd('/')
@@ -85,7 +89,9 @@ Write-Log "Search path : $resolvedSearch"
 Write-Log "Pattern     : $FolderRegex"
 Write-Log "Server      : $ServerUrl"
 
-# ── Find the target folder ────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Find the target folder
+# ────────────────────────────────────────────────────────────────────────
 
 $getChildArgs = @{
     Path      = $resolvedSearch
@@ -104,7 +110,9 @@ if (-not $match) {
 $targetFolder = $match.FullName
 Write-Log "Matched folder: $targetFolder" -Level Ok
 
-# ── Zip the folder ────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Zip the folder
+# ────────────────────────────────────────────────────────────────────────
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -127,7 +135,9 @@ try {
 $zipSize = (Get-Item $zipPath).Length
 Write-Log "Archive size  : $([math]::Round($zipSize / 1MB, 2)) MB" -Level Ok
 
-# ── Upload to server ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Upload to server
+# ────────────────────────────────────────────────────────────────────────
 # The server's /upload-chunk endpoint accepts a standard multipart/form-data
 # POST with a single file field named "file".
 
@@ -199,7 +209,9 @@ try {
     Write-Log "Unexpected error during upload: $_" -Level Error
     exit 1
 } finally {
-    # ── Cleanup ───────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Cleanup
+# ────────────────────────────────────────────────────────────────────────
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
         Write-Log "Temporary zip deleted." -Level Info
