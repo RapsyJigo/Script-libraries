@@ -339,9 +339,9 @@ if ($vsixFiles.Count -eq 0) {
 # ---------------------------------------------------------------------------
 # Step 6 – Deploy to each existing user profile
 # ---------------------------------------------------------------------------
-foreach ($profile in $userProfiles) {
-    $extensionsDir = Join-Path $profile.FullName '.vscode\extensions'
-    Write-Log "Processing user: $($profile.Name)"
+foreach ($current_profile in $userProfiles) {
+    $extensionsDir = Join-Path $current_profile.FullName '.vscode\extensions'
+    Write-Log "Processing user: $($current_profile.Name)"
 
     $newEntries = @()
 
@@ -369,17 +369,17 @@ foreach ($profile in $userProfiles) {
 
         # Collect entry regardless of whether we just extracted or it was already there,
         # so extensions.json stays consistent even on re-runs.
-        $newEntries += New-ExtensionEntry -Meta $meta -ProfilePath $profile.FullName
+        $newEntries += New-ExtensionEntry -Meta $meta -ProfilePath $current_profile.FullName
     }
 
     # --- Update extensions.json ---
     if ($newEntries.Count -gt 0) {
-        if ($PSCmdlet.ShouldProcess((Join-Path $extensionsDir 'extensions.json'), "Update extensions.json for $($profile.Name)")) {
+        if ($PSCmdlet.ShouldProcess((Join-Path $extensionsDir 'extensions.json'), "Update extensions.json for $($current_profile.Name)")) {
             try {
                 Update-ExtensionsJson -ExtensionsDir $extensionsDir -NewEntries $newEntries
                 Write-Log "    extensions.json updated."
             } catch {
-                Write-Log "    FAILED updating extensions.json for '$($profile.Name)': $_" -Level ERROR
+                Write-Log "    FAILED updating extensions.json for '$($current_profile.Name)': $_" -Level ERROR
             }
         }
     }
