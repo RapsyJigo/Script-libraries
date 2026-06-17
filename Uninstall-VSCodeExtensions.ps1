@@ -53,9 +53,9 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Helpers
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR')]$Level = 'INFO')
     $ts    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -117,9 +117,9 @@ function Remove-ExtensionEntries {
     }
 }
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Step 1 – Parse and validate extension IDs
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 Write-Log "Parsing extension list."
 
 $ExtensionIdPattern = '^[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$'
@@ -142,9 +142,9 @@ if ($extensionIds.Count -eq 0) {
 
 Write-Log "Extensions to uninstall: $($extensionIds -join ', ')"
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Step 2 – Resolve VS Code install path (for bootstrap folder)
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 if (-not $VsCodeInstallPath) {
     $candidates = @(
         "$env:ProgramFiles\Microsoft VS Code",
@@ -159,9 +159,9 @@ if ($VsCodeInstallPath) {
     Write-Log "VS Code installation not found — bootstrap cleanup will be skipped." -Level WARN
 }
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Step 3 – Collect real user profiles
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 $skipNames = @('Public', 'Default', 'Default User', 'All Users', 'defaultuser0')
 
 $userProfiles = Get-ChildItem -Path $UserProfilesRoot -Directory -ErrorAction SilentlyContinue |
@@ -169,9 +169,9 @@ $userProfiles = Get-ChildItem -Path $UserProfilesRoot -Directory -ErrorAction Si
 
 Write-Log "Found $($userProfiles.Count) user profile(s): $($userProfiles.Name -join ', ')"
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Step 4 – Remove extension folders and registry entries from each user
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 foreach ($profile in $userProfiles) {
     $extensionsDir = Join-Path $profile.FullName '.vscode\extensions'
 
@@ -215,9 +215,9 @@ foreach ($profile in $userProfiles) {
     }
 }
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Step 5 – Clean up the bootstrap folder
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 if ($VsCodeInstallPath) {
     $bootstrapDir = Join-Path $VsCodeInstallPath 'bootstrap\extensions'
 
@@ -250,7 +250,7 @@ if ($VsCodeInstallPath) {
     }
 }
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 # Step 6 – Summary
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────
 Write-Log "Done. Uninstalled $($extensionIds.Count) extension(s) from $($userProfiles.Count) user profile(s)."

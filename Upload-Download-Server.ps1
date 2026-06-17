@@ -200,7 +200,7 @@ $script:ServerSettings = @{
 }
 
 # ────────────────────────────────────────────────────────────────────────
-# >> Self-Elevation
+# >> Elevation check
 # ────────────────────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
