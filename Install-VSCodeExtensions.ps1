@@ -1,30 +1,26 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Installs VSCode extensions for all users on the system using Microsoft's
-    bootstrapping mechanism (machine-wide extensions.json).
+    Pre-installs VSCode extensions for all users via the official bootstrap mechanism.
 
 .DESCRIPTION
-    Parses a CSV string of extension IDs and registers them in the machine-wide
-    VSCode bootstrapping file (%ProgramData%\Microsoft\VSCode\extensions.json).
-    VSCode reads this file on startup and automatically installs any listed
-    extensions for the current user if they are not already installed.
+    Downloads .vsix files from the VS Code Marketplace and places them in the
+    bootstrap\extensions folder inside the VS Code installation directory.
+    On next launch, VS Code silently installs any extensions found in that folder
+    for the current user — this is the Microsoft-intended enterprise deployment path.
 
-    This uses the official Microsoft-intended approach for pre-deploying default
-    extensions in enterprise/Intune scenarios — no per-user CLI invocation needed.
+    Supports both system-wide installs (C:\Program Files\Microsoft VS Code) and
+    per-user installs (%LocalAppData%\Programs\Microsoft VS Code).
 
 .PARAMETER ExtensionsCsv
-    A CSV-formatted string of extension IDs.
-    Values may be comma-separated, newline-separated, or both.
-    Extension IDs must follow the format: publisher.extensionname
-    An optional header token of "extensionid" is automatically skipped.
+    A comma or newline-separated string of extension IDs in publisher.name format.
 
-.PARAMETER Force
-    If specified, overwrites the existing extensions.json entirely.
-    By default, the script merges new IDs with any existing entries.
+.PARAMETER VsCodeInstallPath
+    Path to the VS Code installation directory. If omitted, the script auto-detects
+    the system install, then falls back to the current user's local install.
 
 .EXAMPLE
-    .\Install-VSCodeExtensions.ps1 -ExtensionsCsv "ms-python.python,esbenp.prettier-vscode,dbaeumer.vscode-eslint"
+    .\Install-VSCodeExtensions.ps1 -ExtensionsCsv "ms-python.python,esbenp.prettier-vscode"
 
 .EXAMPLE
     $csv = @"
@@ -32,11 +28,15 @@ ms-python.python
 esbenp.prettier-vscode
 dbaeumer.vscode-eslint
 "@
-    .\Install-VSCodeExtensions.ps1 -ExtensionsCsv $csv -Force
+    .\Install-VSCodeExtensions.ps1 -ExtensionsCsv $csv
 
 .NOTES
+    Extensions are only installed on a user's FIRST launch of VS Code.
+    If a user has already launched VS Code, this will not reinstall extensions
+    they have previously uninstalled.
+
     References:
-        https://code.visualstudio.com/docs/setup/enterprise#_default-extensions
+        https://code.visualstudio.com/docs/enterprise/extensions#_bootstrapping-extensions
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -44,17 +44,11 @@ param (
     [Parameter(Mandatory, HelpMessage = "Comma or newline-separated extension IDs (publisher.name).")]
     [string]$ExtensionsCsv,
 
-    [switch]$Force
+    [string]$VsCodeInstallPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-$BootstrapDir  = Join-Path $env:ProgramData 'Microsoft\VSCode'
-$BootstrapFile = Join-Path $BootstrapDir    'extensions.json'
 
 # ---------------------------------------------------------------------------
 # Helper: Write timestamped log lines
@@ -67,20 +61,44 @@ function Write-Log {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1 – Parse and validate the CSV string
+# Step 1 – Resolve VS Code installation path
 # ---------------------------------------------------------------------------
-Write-Log "Parsing extension list from input string."
+if ($VsCodeInstallPath) {
+    if (-not (Test-Path $VsCodeInstallPath)) {
+        Write-Log "Specified VsCodeInstallPath does not exist: $VsCodeInstallPath" -Level ERROR
+        exit 1
+    }
+} else {
+    # Prefer the system-wide install (requires admin, covers all users cleanly)
+    $systemInstall = "$env:ProgramFiles\Microsoft VS Code"
+    $userInstall   = "$env:LOCALAPPDATA\Programs\Microsoft VS Code"
+
+    if (Test-Path $systemInstall) {
+        $VsCodeInstallPath = $systemInstall
+        Write-Log "Detected system-wide VS Code install: $VsCodeInstallPath"
+    } elseif (Test-Path $userInstall) {
+        $VsCodeInstallPath = $userInstall
+        Write-Log "Detected per-user VS Code install: $VsCodeInstallPath" -Level WARN
+        Write-Log "Note: bootstrapping from a per-user install only affects that user." -Level WARN
+    } else {
+        Write-Log "VS Code installation not found. Pass -VsCodeInstallPath explicitly." -Level ERROR
+        exit 1
+    }
+}
+
+$bootstrapDir = Join-Path $VsCodeInstallPath 'bootstrap\extensions'
+
+# ---------------------------------------------------------------------------
+# Step 2 – Parse and validate the extension ID list
+# ---------------------------------------------------------------------------
+Write-Log "Parsing extension list."
 
 $ExtensionIdPattern = '^[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$'
 
-# Split on commas and/or newlines, then normalise each token
-$newIds = $ExtensionsCsv -split '[,\r\n]+' |
+$extensionIds = $ExtensionsCsv -split '[,\r\n]+' |
     ForEach-Object { $_.Trim().ToLower() } |
-    Where-Object   { $_ -ne '' } |
+    Where-Object   { $_ -ne '' -and $_ -ne 'extensionid' } |
     Where-Object   {
-        # Skip an optional header token (e.g. "extensionid")
-        if ($_ -eq 'extensionid') { return $false }
-
         if ($_ -notmatch $ExtensionIdPattern) {
             Write-Log "Skipping invalid extension ID: '$_'" -Level WARN
             $false
@@ -88,72 +106,64 @@ $newIds = $ExtensionsCsv -split '[,\r\n]+' |
     } |
     Sort-Object -Unique
 
-if ($newIds.Count -eq 0) {
-    Write-Log "No valid extension IDs found in the input. Exiting." -Level WARN
+if ($extensionIds.Count -eq 0) {
+    Write-Log "No valid extension IDs found in input. Exiting." -Level WARN
     exit 0
 }
 
-Write-Log "Found $($newIds.Count) valid extension ID(s)."
+Write-Log "Found $($extensionIds.Count) extension(s) to process."
 
 # ---------------------------------------------------------------------------
-# Step 2 – Load existing bootstrap file (merge unless -Force)
+# Step 3 – Create bootstrap\extensions folder
 # ---------------------------------------------------------------------------
-$mergedIds = [System.Collections.Generic.List[string]]::new()
+if (-not (Test-Path $bootstrapDir)) {
+    Write-Log "Creating bootstrap folder: $bootstrapDir"
+    if ($PSCmdlet.ShouldProcess($bootstrapDir, 'Create directory')) {
+        New-Item -ItemType Directory -Path $bootstrapDir -Force | Out-Null
+    }
+} else {
+    Write-Log "Bootstrap folder already exists: $bootstrapDir"
+}
 
-if (-not $Force -and (Test-Path $BootstrapFile)) {
-    Write-Log "Merging with existing bootstrap file: $BootstrapFile"
-    try {
-        $existing = Get-Content -Path $BootstrapFile -Raw | ConvertFrom-Json
+# ---------------------------------------------------------------------------
+# Step 4 – Download each extension as a .vsix from the marketplace
+# ---------------------------------------------------------------------------
+$successCount = 0
+$failCount    = 0
 
-        # The file is a JSON array of strings
-        if ($existing -is [System.Array]) {
-            foreach ($id in $existing) {
-                $normalised = $id.Trim().ToLower()
-                if ($normalised -ne '' -and $mergedIds -notcontains $normalised) {
-                    $mergedIds.Add($normalised)
-                }
-            }
-            Write-Log "Loaded $($mergedIds.Count) existing extension ID(s)."
-        } else {
-            Write-Log "Existing file is not a JSON array — treating as empty." -Level WARN
+foreach ($id in $extensionIds) {
+    $publisher, $name = $id -split '\.', 2
+    $vsixPath = Join-Path $bootstrapDir "$id.vsix"
+
+    if (Test-Path $vsixPath) {
+        Write-Log "  = Already present, skipping: $id"
+        $successCount++
+        continue
+    }
+
+    # Use the gallery CDN URL which supports /latest/ without needing a version lookup
+    $downloadUrl = "https://$publisher.gallery.vsassets.io/_apis/public/gallery/publisher/$publisher/extension/$name/latest/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage"
+
+    Write-Log "  + Downloading: $id"
+
+    if ($PSCmdlet.ShouldProcess($id, 'Download VSIX')) {
+        try {
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $vsixPath -UseBasicParsing -ErrorAction Stop
+            $sizeMB = [math]::Round((Get-Item $vsixPath).Length / 1MB, 2)
+            Write-Log "    Saved to: $vsixPath ($sizeMB MB)"
+            $successCount++
+        } catch {
+            Write-Log "    Failed to download '$id': $_" -Level ERROR
+            # Clean up a partial file if it exists
+            if (Test-Path $vsixPath) { Remove-Item $vsixPath -Force }
+            $failCount++
         }
-    } catch {
-        Write-Log "Could not parse existing extensions.json: $_" -Level WARN
-        Write-Log "Proceeding with input entries only." -Level WARN
-    }
-} elseif ($Force) {
-    Write-Log "-Force specified: existing bootstrap file will be overwritten."
-}
-
-# Merge new IDs
-foreach ($id in $newIds) {
-    if ($mergedIds -notcontains $id) {
-        $mergedIds.Add($id)
-        Write-Log "  + Adding: $id"
-    } else {
-        Write-Log "  = Already present: $id"
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 3 – Write the bootstrap file
+# Step 5 – Summary
 # ---------------------------------------------------------------------------
-if (-not (Test-Path $BootstrapDir)) {
-    Write-Log "Creating directory: $BootstrapDir"
-    if ($PSCmdlet.ShouldProcess($BootstrapDir, 'Create directory')) {
-        New-Item -ItemType Directory -Path $BootstrapDir -Force | Out-Null
-    }
-}
-
-$json = $mergedIds | ConvertTo-Json -Depth 1
-
-if ($PSCmdlet.ShouldProcess($BootstrapFile, 'Write extensions.json')) {
-    Set-Content -Path $BootstrapFile -Value $json -Encoding UTF8 -Force
-    Write-Log "Bootstrap file written: $BootstrapFile"
-}
-
-# ---------------------------------------------------------------------------
-# Step 4 – Summary
-# ---------------------------------------------------------------------------
-Write-Log "Done. $($mergedIds.Count) total extension(s) registered."
-Write-Log "VSCode will install missing extensions automatically on next launch per user."
+Write-Log "Done. $successCount extension(s) ready in bootstrap folder, $failCount failed."
+Write-Log "Path: $bootstrapDir"
+Write-Log "VS Code will install these extensions silently on each user's first launch."
