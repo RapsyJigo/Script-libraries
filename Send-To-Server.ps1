@@ -27,11 +27,11 @@
   children of -SearchPath.
 
 .EXAMPLE
-  .\Send-FolderToServer.ps1 -ServerUrl "http://192.168.1.50" `
+  .\Send-To-Server.ps1 -ServerUrl "http://192.168.1.50" `
       -SearchPath "C:\Students" -FolderRegex "^JohnDoe_"
 
 .EXAMPLE
-  .\Send-FolderToServer.ps1 -ServerUrl "http://192.168.1.50:9090" `
+  .\Send-To-Server.ps1 -ServerUrl "http://192.168.1.50:9090" `
       -SearchPath "D:\Work" -FolderRegex "Project_2026" -Recurse
 #>
 param(

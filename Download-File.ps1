@@ -1,16 +1,31 @@
-# Download-File.ps1
-# Downloads a file from a URL and saves it to a specified directory,
-# preserving the original filename from the URL.
-# If the file is an archive, it will be extracted automatically.
-# Extraction uses 7-Zip if installed, otherwise falls back to Expand-Archive (zip only).
-#
-# USAGE:
-#   .\Download-File.ps1 -Url <url> -Destination <folder>
-#
-# EXAMPLES:
-#   .\Download-File.ps1 -Url "https://example.com/report.pdf" -Destination "C:\Downloads"
-#   .\Download-File.ps1 -Url "https://example.com/archive.zip" -Destination "."
-#   .\Download-File.ps1 -Url "https://example.com/download?name=archive.zip" -Destination "."
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  Downloads a file from a URL, saves it to a specified directory, and 
+  automatically extracts it if it is an archive.
+
+.DESCRIPTION
+  1. Resolves the correct filename from the URL's response headers or its path.
+  2. Ensures the target destination directory exists.
+  3. Downloads the file via a WebClient request.
+  4. Automatically detects and extracts supported archive types. Extraction 
+     uses 7-Zip if installed, otherwise falls back to Expand-Archive for zip files.
+
+.PARAMETER Url
+  The absolute URL of the file to download.
+
+.PARAMETER Destination
+  The local directory path where the file will be saved and extracted.
+
+.EXAMPLE
+  .\Download-File.ps1 -Url "https://example.com/report.pdf" -Destination "C:\Downloads"
+
+.EXAMPLE
+  .\Download-File.ps1 -Url "https://example.com/archive.zip" -Destination "."
+
+.EXAMPLE
+  .\Download-File.ps1 -Url "https://example.com/download?name=archive.zip" -Destination "."
+#>
 
 [CmdletBinding()]
 param (

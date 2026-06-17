@@ -20,10 +20,10 @@
     Common values: "Users", "Administrators", "Remote Desktop Users", "Power Users"
 
 .EXAMPLE
-    .\New-ManagedUser.ps1 -Username "servicedesk" -Password "P@ssw0rd!" -Group "Administrators"
+    .\Create-LocalUser.ps1 -Username "servicedesk" -Password "P@ssw0rd!" -Group "Administrators"
 
 .EXAMPLE
-    .\New-ManagedUser.ps1 -Username "kiosk" -Password "" -Group "Users"
+    .\Create-LocalUser.ps1 -Username "kiosk" -Password "" -Group "Users"
 #>
 
 [CmdletBinding()]

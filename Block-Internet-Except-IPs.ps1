@@ -14,7 +14,7 @@
     Comma-separated string of IP addresses or CIDR ranges to allow.
 
 .EXAMPLE
-    .\Set-IPAllowlist.ps1 -AllowedIPs "8.8.8.8,1.1.1.1,192.168.1.0/24"
+    .\Block-Internet-Except-IPs.ps1 -AllowedIPs "8.8.8.8,1.1.1.1,192.168.1.0/24"
 #>
 
 param (

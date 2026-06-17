@@ -10,7 +10,7 @@
     No backup file required — operates purely by rule prefix and profile defaults.
 
 .EXAMPLE
-    .\Restore-Firewall.ps1
+    .\Unblock-Internet.ps1
 #>
 
 $RulePrefix = "IPAllowlist_"

@@ -11,7 +11,7 @@
     The local username to delete.
 
 .EXAMPLE
-    .\Remove-LocalUserAndFiles.ps1 -Username "jsmith"
+    .\Delete-LocalUser.ps1 -Username "jsmith"
 #>
 
 [CmdletBinding()]
