@@ -271,7 +271,7 @@ $skipNames = @('Public', 'Default', 'Default User', 'All Users', 'defaultuser0')
 $userProfiles = Get-ChildItem -Path $UserProfilesRoot -Directory -ErrorAction SilentlyContinue |
     Where-Object { $skipNames -notcontains $_.Name }
 
-Write-Log "Found $(@($userProfiles).Count) user profile(s): $($userProfiles.Name -join ', ')"
+#Write-Log "Found $(@($userProfiles).Count) user profile(s): $($userProfiles.Name -join ', ')"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # >> Get marketplace metadata
