@@ -239,12 +239,12 @@ $extensionIds = $ExtensionsCsv -split '[,\r\n]+' |
     } |
     Sort-Object -Unique
 
-if ($extensionIds.Count -eq 0) {
+if (($extensionIds).Count -eq 0) {
     Write-Log "No valid extension IDs found in input. Exiting." -Level WARN
     exit 0
 }
 
-Write-Log "Found $($extensionIds.Count) extension(s) to deploy."
+Write-Log "Found $(($extensionIds).Count) extension(s) to deploy."
 
 # ─────────────────────────────────────────────────────────────────────────────
 # >> Validate install path
@@ -271,7 +271,7 @@ $skipNames = @('Public', 'Default', 'Default User', 'All Users', 'defaultuser0')
 $userProfiles = Get-ChildItem -Path $UserProfilesRoot -Directory -ErrorAction SilentlyContinue |
     Where-Object { $skipNames -notcontains $_.Name }
 
-Write-Log "Found $($userProfiles.Count) user profile(s): $($userProfiles.Name -join ', ')"
+Write-Log "Found $(($userProfiles).Count) user profile(s): $($userProfiles.Name -join ', ')"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # >> Get marketplace metadata
@@ -290,7 +290,7 @@ foreach ($id in $extensionIds) {
     }
 }
 
-if ($allMeta.Count -eq 0) {
+if (($allMeta).Count -eq 0) {
     Write-Log "No metadata could be fetched. Exiting." -Level ERROR
     exit 1
 }
@@ -331,7 +331,7 @@ foreach ($id in $allMeta.Keys) {
     }
 }
 
-if ($vsixFiles.Count -eq 0) {
+if (($vsixFiles).Count -eq 0) {
     Write-Log "No extensions downloaded successfully. Exiting." -Level ERROR
     exit 1
 }
@@ -373,7 +373,7 @@ foreach ($current_profile in $userProfiles) {
     }
 
     # --- Update extensions.json ---
-    if ($newEntries.Count -gt 0) {
+    if (($newEntries).Count -gt 0) {
         if ($PSCmdlet.ShouldProcess((Join-Path $extensionsDir 'extensions.json'), "Update extensions.json for $($current_profile.Name)")) {
             try {
                 Update-ExtensionsJson -ExtensionsDir $extensionsDir -NewEntries $newEntries
@@ -411,4 +411,4 @@ if ($VsCodeInstallPath) {
     }
 }
 
-Write-Log "Done. Processed $($vsixFiles.Count) extension(s) across $($userProfiles.Count) user profile(s)."
+Write-Log "Done. Processed $(($vsixFiles).Count) extension(s) across $(($userProfiles).Count) user profile(s)."
