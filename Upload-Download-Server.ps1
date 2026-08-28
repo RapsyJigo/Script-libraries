@@ -2609,7 +2609,6 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
           During the window, a countdown to close is shown. After the end time, uploads are locked and visitors see when uploads concluded.
           Times use this machine's local timezone.
         </p>
-        <input type="checkbox" id="uploadWindowEnabled"$(if ($winEnabled) { ' checked' })>
         <div class="window-enable-row" id="windowEnableRow" onclick="toggleWindowEnabled()">
           <span class="toggle-track" id="toggleTrack"></span>
           <span class="window-enable-label">
