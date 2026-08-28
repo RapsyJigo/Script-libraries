@@ -230,6 +230,9 @@ $script:AllSendersZipCache = @{
 }
 $script:AllSendersZipLock = [object]::new()
 
+$script:ChatMessages = [System.Collections.Generic.List[object]]::new()
+$script:ChatLock = [object]::new()
+
 $script:FirewallRuleName = "ScriptLibs-UploadDownloadServer-TCP-$Port"
 $script:FirewallRuleCreated = $false
 
@@ -273,6 +276,122 @@ function Get-SessionCookieAttributes([System.Net.HttpListenerRequest]$req) {
 function Test-IsLocalRequest([System.Net.HttpListenerRequest]$req) {
     if (-not $req.RemoteEndPoint) { return $false }
     return [System.Net.IPAddress]::IsLoopback($req.RemoteEndPoint.Address)
+}
+
+# ────────────────────────────────────────────────────────────────────────
+# >> Chat store (flat-file JSON "database", in-memory mirror for speed)
+# ────────────────────────────────────────────────────────────────────────
+function Get-ChatDataDir {
+    $dir = Join-Path $script:ServerSettings.UploadFolder '_chat'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    return $dir
+}
+
+function Get-ChatDataFile {
+    return Join-Path (Get-ChatDataDir) 'messages.json'
+}
+
+function Initialize-ChatStore {
+    # Loads any persisted messages from disk into the shared in-memory list.
+    # Must run BEFORE the runspace pool is created so every runspace sees the same list instance.
+    $file = Get-ChatDataFile
+    $script:ChatMessages.Clear()
+    if (Test-Path -LiteralPath $file) {
+        try {
+            $raw = Get-Content -LiteralPath $file -Raw -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $items = @(ConvertFrom-Json $raw -ErrorAction Stop)
+                foreach ($item in $items) {
+                    $script:ChatMessages.Add([hashtable]@{
+                        id       = [int64]$item.id
+                        cid      = [string]$item.cid
+                        from     = [string]$item.from
+                        username = [string]$item.username
+                        text     = [string]$item.text
+                        ip       = [string]$item.ip
+                        ts       = [int64]$item.ts
+                    })
+                }
+            }
+        } catch {
+            Write-ServerLog "Failed to load chat history from '$file': $($_.Exception.Message)" -Level Warn
+        }
+    }
+}
+
+function Save-ChatStoreToDisk {
+    # Caller must already hold $script:ChatLock.
+    $file = Get-ChatDataFile
+    try {
+        $json = @($script:ChatMessages) | ConvertTo-Json -Depth 4 -Compress
+        Set-Content -LiteralPath $file -Value $json -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-ServerLog "Failed to save chat history to '$file': $($_.Exception.Message)" -Level Warn
+    }
+}
+
+function Test-ChatCid([string]$cid) {
+    return (-not [string]::IsNullOrEmpty($cid)) -and ($cid -match '^[A-Za-z0-9\-]{8,64}$')
+}
+
+function Add-ChatMessage([string]$cid, [string]$from, [string]$username, [string]$text, [string]$ip) {
+    [System.Threading.Monitor]::Enter($script:ChatLock)
+    try {
+        $nextId = 1
+        if ($script:ChatMessages.Count -gt 0) {
+            $nextId = [int64]($script:ChatMessages[$script:ChatMessages.Count - 1].id) + 1
+        }
+        $msg = [hashtable]@{
+            id       = $nextId
+            cid      = $cid
+            from     = $from
+            username = $username
+            text     = $text
+            ip       = $ip
+            ts       = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        }
+        $script:ChatMessages.Add($msg)
+        Save-ChatStoreToDisk
+        return $msg
+    } finally {
+        [System.Threading.Monitor]::Exit($script:ChatLock)
+    }
+}
+
+function Get-ChatMessagesForCid([string]$cid, [int64]$sinceId = 0) {
+    [System.Threading.Monitor]::Enter($script:ChatLock)
+    try {
+        return @($script:ChatMessages | Where-Object { $_.cid -eq $cid -and [int64]$_.id -gt $sinceId } | Sort-Object { [int64]$_.id })
+    } finally {
+        [System.Threading.Monitor]::Exit($script:ChatLock)
+    }
+}
+
+function Get-ChatThreadsSummary {
+    [System.Threading.Monitor]::Enter($script:ChatLock)
+    try {
+        $groups = $script:ChatMessages | Group-Object -Property cid
+        $threads = foreach ($g in $groups) {
+            $sorted = @($g.Group | Sort-Object { [int64]$_.id })
+            $last = $sorted[-1]
+            $lastUserMsg = @($sorted | Where-Object { $_.from -eq 'user' })
+            $displayName = if ($lastUserMsg.Count -gt 0) { $lastUserMsg[-1].username } else { 'Anonymous' }
+            [pscustomobject]@{
+                cid      = $g.Name
+                username = $displayName
+                ip       = $last.ip
+                lastText = $last.text
+                lastFrom = $last.from
+                lastTs   = [int64]$last.ts
+                unread   = ($last.from -eq 'user')
+            }
+        }
+        return @($threads | Sort-Object -Property lastTs -Descending)
+    } finally {
+        [System.Threading.Monitor]::Exit($script:ChatLock)
+    }
 }
 
 function Test-RegexPattern([string]$pattern, [ref]$errorMsg) {
@@ -1014,6 +1133,18 @@ $CSS_SHARED = @'
     position: absolute; top: 0; left: 0; right: 0; height: 3px;
     background: linear-gradient(90deg, var(--accent), var(--accent2));
   }
+  /* ── Mobile: stack the topbar (title / meta / nav) and let the page scroll normally ── */
+  @media (max-width: 600px) {
+    html, body { overflow: auto; }
+    .topbar {
+      position: static; height: auto; flex-direction: column; align-items: stretch;
+      padding: 1rem 1.2rem;
+    }
+    .topbar-title { text-align: center; }
+    .topbar-nav { flex-direction: column; align-items: stretch; width: 100%; gap: .5rem; margin-top: .3rem; }
+    .topbar-nav a { text-align: center; }
+    .page { position: static; padding: 1.2rem; }
+  }
 '@
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1103,7 +1234,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     width: 100%;
     max-width: 1400px;
     margin: 0 auto;
-    height: 100%;
+    height: auto;
     align-items: start;
     min-width: 0;
   }
@@ -1112,7 +1243,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   }
   .upload-panel {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 16px; padding: 2rem;
+    border-radius: 16px; padding: 1.6rem;
     position: sticky; top: 0;
     min-width: 0; width: 100%;
   }
@@ -1124,7 +1255,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   .upload-panel { position: relative; overflow: hidden; }
   .drop-zone {
     border: 2px dashed var(--border); border-radius: var(--radius);
-    padding: 2.5rem 1rem; text-align: center; cursor: pointer;
+    padding: 1.7rem 1rem; text-align: center; cursor: pointer;
     transition: border-color .2s, background .2s; margin-top: 1.2rem;
     background: transparent;
   }
@@ -1208,7 +1339,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   .filelist-panel {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 16px; padding: 1.5rem 2rem;
-    min-height: 300px; min-width: 0; width: 100%; overflow: hidden;
+    min-height: 220px; min-width: 0; width: 100%; overflow: hidden;
   }
   .filelist-header {
     display: flex; align-items: center; justify-content: space-between;
@@ -1297,6 +1428,34 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     color: var(--accent2); letter-spacing: .04em;
   }
   .time-window-banner.locked .time-window-countdown { color: var(--danger); }
+  /* ── Chat widget ── */
+  .chat-widget {
+    max-width: 900px; margin: 1.4rem auto 0; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  }
+  .chat-widget-head {
+    display: flex; align-items: center; justify-content: space-between; gap: .8rem;
+    padding: .9rem 1.2rem; border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .chat-widget-head-title { font-weight: 700; }
+  .chat-widget-toggle { color: var(--muted); font-family: var(--mono); font-size: .8rem; }
+  .chat-widget-body { display: none; }
+  .chat-widget.open .chat-widget-body { display: block; }
+  .chat-widget-name-row { display: flex; align-items: center; gap: .6rem; padding: .9rem 1.2rem; border-bottom: 1px solid var(--border); }
+  .chat-widget-name-row label { margin: 0; flex-shrink: 0; }
+  .chat-widget-name-row input[type=text] { max-width: 220px; }
+  .chat-widget-msgs {
+    max-height: 280px; overflow-y: auto; padding: 1rem 1.2rem;
+    display: flex; flex-direction: column; gap: .6rem;
+  }
+  .chat-widget-empty { color: var(--muted); font-family: var(--mono); font-size: .82rem; }
+  .chat-widget-bubble { max-width: 78%; padding: .55rem .85rem; border-radius: var(--radius); font-size: .88rem; line-height: 1.4; word-wrap: break-word; }
+  .chat-widget-bubble.mine { align-self: flex-end; background: var(--accent); color: #0d0d0f; }
+  .chat-widget-bubble.theirs { align-self: flex-start; background: var(--surface2); border: 1px solid var(--border); }
+  .chat-widget-bubble-meta { font-size: .65rem; font-family: var(--mono); opacity: .65; margin-top: .25rem; }
+  .chat-widget-input-row { display: flex; gap: .6rem; padding: 1rem 1.2rem; }
+  .chat-widget-input-row input[type=text] { flex: 1; }
+  .chat-widget-input-row button { width: auto; margin-top: 0; padding: .75rem 1.3rem; white-space: nowrap; }
 </style></head>
 <body>
 <div class="topbar">
@@ -1366,6 +1525,27 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     </div>
 
   </div>
+
+  <div class="chat-widget" id="chatWidget">
+    <div class="chat-widget-head" onclick="toggleChatWidget()">
+      <span class="chat-widget-head-title">&#128172; Message the admin</span>
+      <span class="chat-widget-toggle" id="chatWidgetToggle">Show &darr;</span>
+    </div>
+    <div class="chat-widget-body">
+      <div class="chat-widget-name-row">
+        <label for="chatName" style="margin:0;">Name</label>
+        <input type="text" id="chatName" placeholder="Your name" maxlength="40">
+      </div>
+      <div class="chat-widget-msgs" id="chatWidgetMsgs">
+        <div class="chat-widget-empty">No messages yet — say hello!</div>
+      </div>
+      <div class="chat-widget-input-row">
+        <input type="text" id="chatWidgetInput" placeholder="Type a message&hellip;" maxlength="4000">
+        <button type="button" class="btn" onclick="sendChatMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -1705,6 +1885,93 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
     window.location.href = '/?' + q;
   }, 1200);
 });
+
+// ── Chat widget ──
+var chatCid = localStorage.getItem('chatCid') || '';
+var chatLastId = 0;
+var chatPollTimer = null;
+
+(function initChatName() {
+  var saved = localStorage.getItem('chatName');
+  if (saved) document.getElementById('chatName').value = saved;
+})();
+document.getElementById('chatName').addEventListener('change', function() {
+  localStorage.setItem('chatName', this.value);
+});
+
+function toggleChatWidget() {
+  var w = document.getElementById('chatWidget');
+  var open = w.classList.toggle('open');
+  document.getElementById('chatWidgetToggle').textContent = open ? 'Hide \u2191' : 'Show \u2193';
+  if (open) {
+    loadChatHistory();
+    if (!chatPollTimer) chatPollTimer = setInterval(pollChatWidget, 3000);
+  }
+}
+
+function fmtChatTime(ts) {
+  var d = new Date(ts);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderChatMessages(msgs, append) {
+  var box = document.getElementById('chatWidgetMsgs');
+  if (!append) box.innerHTML = '';
+  if (!append && !msgs.length) { box.innerHTML = '<div class="chat-widget-empty">No messages yet \u2014 say hello!</div>'; }
+  msgs.forEach(function(m) {
+    chatLastId = Math.max(chatLastId, m.id);
+    var div = document.createElement('div');
+    div.className = 'chat-widget-bubble ' + (m.from === 'user' ? 'mine' : 'theirs');
+    div.innerHTML = escHtml(m.text) + '<div class="chat-widget-bubble-meta">' + (m.from === 'admin' ? 'Admin' : 'You') + ' \u00b7 ' + fmtChatTime(m.ts) + '</div>';
+    box.appendChild(div);
+  });
+  if (msgs.length) box.scrollTop = box.scrollHeight;
+}
+
+function loadChatHistory() {
+  if (!chatCid) return;
+  fetch('/chat/poll?cid=' + encodeURIComponent(chatCid) + '&since=0').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) renderChatMessages(d.messages, false);
+  }).catch(function() {});
+}
+
+function pollChatWidget() {
+  if (!chatCid) return;
+  fetch('/chat/poll?cid=' + encodeURIComponent(chatCid) + '&since=' + chatLastId).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok && d.messages.length) renderChatMessages(d.messages, true);
+  }).catch(function() {});
+}
+
+function sendChatMessage() {
+  var input = document.getElementById('chatWidgetInput');
+  var text = input.value.trim();
+  if (!text) return;
+  var name = document.getElementById('chatName').value.trim();
+  localStorage.setItem('chatName', name);
+  fetch('/chat/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cid: chatCid, username: name, message: text })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      if (d.cid && d.cid !== chatCid) { chatCid = d.cid; localStorage.setItem('chatCid', chatCid); }
+      input.value = '';
+      renderChatMessages([d.message], true);
+      if (!chatPollTimer) chatPollTimer = setInterval(pollChatWidget, 3000);
+    }
+  }).catch(function() {});
+}
+
+document.getElementById('chatWidgetInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); sendChatMessage(); }
+});
+
+if (chatCid) {
+  document.getElementById('chatWidget').classList.add('open');
+  document.getElementById('chatWidgetToggle').textContent = 'Hide \u2191';
+  loadChatHistory();
+  chatPollTimer = setInterval(pollChatWidget, 3000);
+}
 </script>
 </body></html>
 "@
@@ -1713,21 +1980,24 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
 # ────────────────────────────────────────────────────────────────────────
 # >> Login Page
 # ────────────────────────────────────────────────────────────────────────
-function Get-LoginPage([bool]$failed = $false) {
+function Get-LoginPage([bool]$failed = $false, [string]$returnTo = "/download") {
     $errHtml = if ($failed) { "<div class='msg err'>&#10007;&nbsp; Incorrect password. Try again.</div>" } else { "" }
+    $safeReturnTo = if ($returnTo -eq "/chat") { "/chat" } else { "/download" }
+    $title = if ($safeReturnTo -eq "/chat") { "Chat" } else { "Download" }
     return @"
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Download — Sign In</title>
+<title>$title — Sign In</title>
 <style>$CSS_SHARED
   html, body { overflow: auto; }
 </style></head>
 <body style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;">
 <div class="card">
-  <h1>Download <span class="badge">Protected</span></h1>
-  <p class="sub" style="margin-top:.3rem;margin-bottom:1.8rem;">Enter the password to access files</p>
+  <h1>$title <span class="badge">Protected</span></h1>
+  <p class="sub" style="margin-top:.3rem;margin-bottom:1.8rem;">Enter the password to access $(if ($safeReturnTo -eq '/chat') { 'chat' } else { 'files' })</p>
   <nav style="margin-bottom:1.5rem;"><a href="/" style="color:var(--muted);font-size:.85rem;text-decoration:none;font-family:var(--mono);border-bottom:1px dashed var(--border);padding-bottom:1px;">&larr; Back to Upload</a></nav>
   <form method="POST" action="/download/login">
+    <input type="hidden" name="returnTo" value="$safeReturnTo">
     <label for="pw">Password</label>
     <input type="password" id="pw" name="password" placeholder="••••••••" autofocus>
     <button type="submit" class="btn">&#128274;&nbsp; Unlock</button>
@@ -2045,6 +2315,7 @@ function Get-DownloadPage {
   </span>
   <nav class="topbar-nav">
     <a href="/">&larr; Upload</a>
+    <a href="/chat">&#128172; Chat</a>
     $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "<a href='/download/logout' class='danger'>&#128274; Lock &amp; Exit</a>" })
   </nav>
 </div>
@@ -2274,6 +2545,175 @@ function copyUrl(btn) {
     window.prompt('Copy this URL:', url);
   });
 }
+</script>
+</body></html>
+"@
+}
+
+# ────────────────────────────────────────────────────────────────────────
+# >> Chat Page (protected — same password/session as /download)
+# ────────────────────────────────────────────────────────────────────────
+function Get-ChatPage {
+    return @"
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chat</title>
+<style>$CSS_SHARED
+  .chat-layout { display: grid; grid-template-columns: 320px 1fr; gap: 1.4rem; height: 100%; }
+  @media (max-width: 800px) { .chat-layout { grid-template-columns: 1fr; } }
+  .chat-threads {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    overflow-y: auto; padding: .5rem;
+  }
+  .chat-thread-empty { color: var(--muted); font-family: var(--mono); font-size: .85rem; padding: 1rem; }
+  .chat-thread-row {
+    display: block; width: 100%; text-align: left; padding: .8rem .9rem; margin-bottom: .4rem;
+    background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius);
+    cursor: pointer; color: var(--text); font-family: var(--font);
+  }
+  .chat-thread-row:hover { border-color: var(--accent); }
+  .chat-thread-row.active { border-color: var(--accent2); background: rgba(0,221,255,.08); }
+  .chat-thread-name { font-weight: 700; font-size: .92rem; display: flex; align-items: center; gap: .4rem; }
+  .chat-thread-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); flex-shrink: 0; }
+  .chat-thread-preview { color: var(--muted); font-size: .78rem; font-family: var(--mono); margin-top: .3rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-thread-ip { color: var(--muted); font-size: .7rem; font-family: var(--mono); margin-top: .15rem; opacity: .7; }
+  .chat-conv {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .chat-conv-head { padding: 1rem 1.2rem; border-bottom: 1px solid var(--border); font-weight: 700; }
+  .chat-conv-body { flex: 1; overflow-y: auto; padding: 1.2rem; display: flex; flex-direction: column; gap: .7rem; }
+  .chat-conv-empty { color: var(--muted); font-family: var(--mono); font-size: .85rem; margin: auto; }
+  .chat-bubble { max-width: 72%; padding: .6rem .9rem; border-radius: var(--radius); font-size: .9rem; line-height: 1.4; word-wrap: break-word; }
+  .chat-bubble.user { align-self: flex-start; background: var(--surface2); border: 1px solid var(--border); }
+  .chat-bubble.admin { align-self: flex-end; background: var(--accent); color: #0d0d0f; }
+  .chat-bubble-meta { font-size: .68rem; font-family: var(--mono); opacity: .65; margin-top: .3rem; }
+  .chat-conv-input { display: flex; gap: .6rem; padding: 1rem; border-top: 1px solid var(--border); }
+  .chat-conv-input input[type=text] { flex: 1; }
+  .chat-conv-input button { width: auto; margin-top: 0; padding: .75rem 1.4rem; white-space: nowrap; }
+</style></head>
+<body>
+<div class="topbar">
+  <span class="topbar-title">&#128172; Chat <span class="badge">Secure</span></span>
+  <span class="topbar-meta"></span>
+  <nav class="topbar-nav">
+    <a href="/download">Downloads</a>
+    <a href="/">&larr; Upload</a>
+    <a href="/download/logout" class="danger">&#128274; Lock &amp; Exit</a>
+  </nav>
+</div>
+<div class="page">
+  <div class="chat-layout">
+    <div class="chat-threads" id="chatThreads">
+      <div class="chat-thread-empty">Loading&hellip;</div>
+    </div>
+    <div class="chat-conv">
+      <div class="chat-conv-head" id="chatConvHead">Select a conversation</div>
+      <div class="chat-conv-body" id="chatConvBody"><div class="chat-conv-empty">No conversation selected.</div></div>
+      <div class="chat-conv-input">
+        <input type="text" id="chatReplyInput" placeholder="Type a reply&hellip;" disabled>
+        <button type="button" class="btn" id="chatReplyBtn" onclick="sendReply()" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+let activeCid = null;
+let lastMsgId = 0;
+
+function fmtTime(ts) {
+  var d = new Date(ts);
+  return d.toLocaleString();
+}
+
+function renderThreads(threads) {
+  var box = document.getElementById('chatThreads');
+  if (!threads.length) { box.innerHTML = '<div class="chat-thread-empty">No messages yet.</div>'; return; }
+  box.innerHTML = threads.map(function(t) {
+    var active = t.cid === activeCid ? ' active' : '';
+    var dot = t.unread ? '<span class="chat-thread-dot"></span>' : '';
+    return '<button type="button" class="chat-thread-row' + active + '" onclick="openThread(\'' + t.cid + '\')">' +
+      '<div class="chat-thread-name">' + dot + escHtml(t.username) + '</div>' +
+      '<div class="chat-thread-preview">' + (t.lastFrom === 'admin' ? 'You: ' : '') + escHtml(t.lastText) + '</div>' +
+      '<div class="chat-thread-ip">' + escHtml(t.ip) + '</div>' +
+      '</button>';
+  }).join('');
+}
+
+function pollThreads() {
+  fetch('/chat/threads').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) renderThreads(d.threads);
+  }).catch(function() {});
+}
+
+function renderMessages(msgs, append) {
+  var body = document.getElementById('chatConvBody');
+  if (!append) body.innerHTML = '';
+  if (!append && !msgs.length) { body.innerHTML = '<div class="chat-conv-empty">No messages yet.</div>'; }
+  msgs.forEach(function(m) {
+    lastMsgId = Math.max(lastMsgId, m.id);
+    var div = document.createElement('div');
+    div.className = 'chat-bubble ' + (m.from === 'admin' ? 'admin' : 'user');
+    div.innerHTML = escHtml(m.text) + '<div class="chat-bubble-meta">' + (m.from === 'admin' ? 'You' : escHtml(m.username)) + ' &middot; ' + fmtTime(m.ts) + '</div>';
+    body.appendChild(div);
+  });
+  if (msgs.length) body.scrollTop = body.scrollHeight;
+}
+
+function openThread(cid) {
+  activeCid = cid;
+  lastMsgId = 0;
+  document.getElementById('chatConvHead').textContent = 'Conversation';
+  document.getElementById('chatReplyInput').disabled = false;
+  document.getElementById('chatReplyBtn').disabled = false;
+  fetch('/chat/messages?cid=' + encodeURIComponent(cid) + '&since=0').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      renderMessages(d.messages, false);
+      if (d.messages.length) {
+        var last = d.messages[d.messages.length - 1];
+        document.getElementById('chatConvHead').textContent = last.from === 'admin' ? 'Conversation' : (last.username || 'Conversation');
+      }
+      var userMsg = d.messages.slice().reverse().find(function(m) { return m.from === 'user'; });
+      if (userMsg) document.getElementById('chatConvHead').textContent = userMsg.username;
+    }
+  }).catch(function() {});
+  pollThreads();
+}
+
+function pollActiveThread() {
+  if (!activeCid) return;
+  fetch('/chat/messages?cid=' + encodeURIComponent(activeCid) + '&since=' + lastMsgId).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok && d.messages.length) renderMessages(d.messages, true);
+  }).catch(function() {});
+}
+
+function sendReply() {
+  var input = document.getElementById('chatReplyInput');
+  var text = input.value.trim();
+  if (!text || !activeCid) return;
+  var btn = document.getElementById('chatReplyBtn');
+  btn.disabled = true;
+  fetch('/chat/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cid: activeCid, message: text })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      input.value = '';
+      renderMessages([d.message], true);
+      pollThreads();
+    }
+  }).catch(function() {}).finally(function() { btn.disabled = false; input.focus(); });
+}
+
+document.getElementById('chatReplyInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); sendReply(); }
+});
+
+pollThreads();
+setInterval(pollThreads, 4000);
+setInterval(pollActiveThread, 3000);
 </script>
 </body></html>
 "@
@@ -2610,6 +3050,7 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
           Times use this machine's local timezone.
         </p>
         <div class="window-enable-row" id="windowEnableRow" onclick="toggleWindowEnabled()">
+          <input type="checkbox" id="uploadWindowEnabled" name="uploadWindowEnabled" style="display:none;" $(if ($winEnabled) { 'checked' }) tabindex="-1" aria-hidden="true">
           <span class="toggle-track" id="toggleTrack"></span>
           <span class="window-enable-label">
             Enable upload time window
@@ -3435,6 +3876,129 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
         }
 
 # ────────────────────────────────────────────────────────────────────────
+# >> POST /chat/send  (public — visitors on the upload page)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/send" -and $method -eq "POST") {
+            $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+            $body   = $reader.ReadToEnd()
+            $data   = $null
+            try { $data = ConvertFrom-Json $body -ErrorAction Stop } catch { $data = $null }
+            $cid  = if ($data) { [string]$data.cid } else { "" }
+            $name = if ($data) { [string]$data.username } else { "" }
+            $text = if ($data) { [string]$data.message } else { "" }
+
+            if (-not (Test-ChatCid $cid)) { $cid = (New-SessionToken) -replace '[^A-Za-z0-9\-]', '' }
+            $name = $name.Trim()
+            if ($name.Length -eq 0) { $name = "Anonymous" }
+            if ($name.Length -gt 40) { $name = $name.Substring(0, 40) }
+            $text = $text.Trim()
+            if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) }
+
+            if ($text.Length -eq 0) {
+                Send-Response $ctx '{"ok":false,"error":"Message is empty."}' -status 400 -contentType "application/json; charset=utf-8"
+            } else {
+                $ip  = $req.RemoteEndPoint.Address.ToString()
+                $msg = Add-ChatMessage -cid $cid -from 'user' -username $name -text $text -ip $ip
+                Write-ServerLog "Chat message from $ip (cid=$cid, user='$name')" -Level Info
+                $payload = (@{ ok = $true; cid = $cid; message = $msg } | ConvertTo-Json -Compress -Depth 4)
+                Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat/poll?cid=...&since=...  (public — visitors poll for replies)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/poll" -and $method -eq "GET") {
+            $cid   = $req.QueryString["cid"]
+            $since = 0L
+            [void][int64]::TryParse($req.QueryString["since"], [ref]$since)
+            if (-not (Test-ChatCid $cid)) {
+                Send-Response $ctx '{"ok":true,"messages":[]}' -contentType "application/json; charset=utf-8"
+            } else {
+                $msgs = @(Get-ChatMessagesForCid -cid $cid -sinceId $since)
+                $payload = (@{ ok = $true; messages = $msgs } | ConvertTo-Json -Compress -Depth 4)
+                Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat  (protected — same password/session as /download)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat" -and $method -eq "GET") {
+            $token = Get-CookieToken $req
+            if ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token)) {
+                Send-Response $ctx (Get-ChatPage)
+            } else {
+                Send-Response $ctx (Get-LoginPage -returnTo "/chat")
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat/threads  (protected — sidebar list, JSON, for polling)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/threads" -and $method -eq "GET") {
+            $token = Get-CookieToken $req
+            if (-not ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token))) {
+                Send-Response $ctx '{"ok":false,"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $threads = @(Get-ChatThreadsSummary)
+                $payload = (@{ ok = $true; threads = $threads } | ConvertTo-Json -Compress -Depth 4)
+                Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat/messages?cid=...&since=...  (protected — one thread's messages)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/messages" -and $method -eq "GET") {
+            $token = Get-CookieToken $req
+            if (-not ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token))) {
+                Send-Response $ctx '{"ok":false,"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $cid   = $req.QueryString["cid"]
+                $since = 0L
+                [void][int64]::TryParse($req.QueryString["since"], [ref]$since)
+                if (-not (Test-ChatCid $cid)) {
+                    Send-Response $ctx '{"ok":false,"error":"Unknown thread."}' -status 400 -contentType "application/json; charset=utf-8"
+                } else {
+                    $msgs = @(Get-ChatMessagesForCid -cid $cid -sinceId $since)
+                    $payload = (@{ ok = $true; messages = $msgs } | ConvertTo-Json -Compress -Depth 4)
+                    Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+                }
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /chat/reply  (protected — admin replies to a thread)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/reply" -and $method -eq "POST") {
+            $token = Get-CookieToken $req
+            if (-not ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token))) {
+                Send-Response $ctx '{"ok":false,"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+                $body   = $reader.ReadToEnd()
+                $data   = $null
+                try { $data = ConvertFrom-Json $body -ErrorAction Stop } catch { $data = $null }
+                $cid  = if ($data) { [string]$data.cid } else { "" }
+                $text = if ($data) { [string]$data.message } else { "" }
+                $text = $text.Trim()
+                if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) }
+                if (-not (Test-ChatCid $cid)) {
+                    Send-Response $ctx '{"ok":false,"error":"Unknown thread."}' -status 400 -contentType "application/json; charset=utf-8"
+                } elseif ($text.Length -eq 0) {
+                    Send-Response $ctx '{"ok":false,"error":"Message is empty."}' -status 400 -contentType "application/json; charset=utf-8"
+                } else {
+                    $ip  = $req.RemoteEndPoint.Address.ToString()
+                    $msg = Add-ChatMessage -cid $cid -from 'admin' -username 'Admin' -text $text -ip $ip
+                    Write-ServerLog "Chat reply sent to cid=$cid" -Level Info
+                    $payload = (@{ ok = $true; message = $msg } | ConvertTo-Json -Compress -Depth 4)
+                    Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+                }
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
 # >> GET /admin (localhost only)
 # ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin") {
@@ -3508,23 +4072,24 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
 # >> POST /download/login
 # ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/login" -and $method -eq "POST") {
+            $reader     = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+            $body       = $reader.ReadToEnd()
+            $parsed     = [System.Web.HttpUtility]::ParseQueryString($body)
+            $returnTo   = if ($parsed["returnTo"] -eq "/chat") { "/chat" } else { "/download" }
             if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) {
-                Send-Redirect $ctx "/download"
+                Send-Redirect $ctx $returnTo
             } else {
-                $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
-                $body   = $reader.ReadToEnd()
-                $parsed = [System.Web.HttpUtility]::ParseQueryString($body)
-                $pw     = $parsed["password"]
+                $pw = $parsed["password"]
                 if ($pw -eq $script:ServerSettings.Password) {
                     $token = New-SessionToken
                     $expiry = (Get-Date).AddHours(4)
                     $Sessions[$token] = $expiry
                     Write-ServerLog "Download login OK from $($req.RemoteEndPoint.Address) (session until $($expiry.ToString('HH:mm:ss')))" -Level Ok
                     $ctx.Response.AppendHeader("Set-Cookie", "ds=$token; $(Get-SessionCookieAttributes $req)")
-                    Send-Redirect $ctx "/download"
+                    Send-Redirect $ctx $returnTo
                 } else {
                     Write-ServerLog "Download login failed from $($req.RemoteEndPoint.Address)" -Level Warn
-                    Send-Response $ctx (Get-LoginPage -failed $true)
+                    Send-Response $ctx (Get-LoginPage -failed $true -returnTo $returnTo)
                 }
             }
         }
@@ -3711,6 +4276,14 @@ function New-RequestRunspacePool {
         'Save-UploadedFile',
         'Send-Response',
         'Send-Redirect',
+        'Get-ChatDataDir',
+        'Get-ChatDataFile',
+        'Save-ChatStoreToDisk',
+        'Test-ChatCid',
+        'Add-ChatMessage',
+        'Get-ChatMessagesForCid',
+        'Get-ChatThreadsSummary',
+        'Get-ChatPage',
         'Handle-HttpContext'
     )
     foreach ($name in $functionNames) {
@@ -3723,6 +4296,8 @@ function New-RequestRunspacePool {
     $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('AllSendersZipCache', $script:AllSendersZipCache, 'Shared all-senders zip cache'))
     $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('AllSendersZipLock', $script:AllSendersZipLock, 'Shared all-senders zip cache lock'))
     $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CSS_SHARED', $CSS_SHARED, 'Shared CSS template'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ChatMessages', $script:ChatMessages, 'Shared chat message store'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ChatLock', $script:ChatLock, 'Shared chat message store lock'))
     $maxRunspaces = [Math]::Max(4, [Environment]::ProcessorCount * 4)
     $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxRunspaces, $iss, $Host)
     $pool.Open()
@@ -3750,6 +4325,7 @@ function Clear-CompletedRequestWorkers {
     }
 }
 
+Initialize-ChatStore
 $script:RequestRunspacePool = New-RequestRunspacePool
 $script:ActiveRequestWorkers = [System.Collections.Generic.List[object]]::new()
 
