@@ -38,11 +38,15 @@
   Optional upload window end (local time). ISO-8601 or "yyyy-MM-dd HH:mm". Empty = no end limit.
   Can also be changed live on /admin (localhost only).
 
+.PARAMETER ChatUsernameRegex
+  Optional regex pattern chat usernames (from the /chat widget on the upload page) must match.
+  Empty string disables validation. Can also be changed live on /admin (localhost only).
+
 .EXAMPLE
   .\Upload-Download-Server.ps1
   .\Upload-Download-Server.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
   .\Upload-Download-Server.ps1 -UploadFileRegex '\.(pdf|docx)$'
-  .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00"
+  .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00" -ChatUsernameRegex "^[A-Za-z0-9 ]{2,20}$"
 #>
 param(
     [Parameter(Mandatory = $false, HelpMessage = "The port on which the server will be opened. Must have no other processes using this port.")]
@@ -72,7 +76,11 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Upload window end (local). Empty = no end limit.")]
     [AllowEmptyString()]
-    [string] $UploadWindowEnd = ""
+    [string] $UploadWindowEnd = "",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Regex pattern chat usernames must match. Empty = no restriction.")]
+    [AllowEmptyString()]
+    [string] $ChatUsernameRegex = ""
 )
 
 # ────────────────────────────────────────────────────────────────────────
@@ -197,6 +205,7 @@ $script:ServerSettings = @{
     UploadWindowEnd      = $parsedWindowEnd
     Port                 = $Port
     PrivateIP            = ""
+    ChatUsernameRegex    = $ChatUsernameRegex
 }
 
 # ────────────────────────────────────────────────────────────────────────
@@ -418,6 +427,20 @@ function Test-UploadFileName([string]$fileName) {
     return @{
         Ok      = $false
         Message = "File name does not match the required pattern. Rejected: $baseName"
+    }
+}
+
+function Test-ChatUsername([string]$username) {
+    $pattern = $script:ServerSettings.ChatUsernameRegex
+    if ([string]::IsNullOrWhiteSpace($pattern)) { return @{ Ok = $true } }
+    $regexErr = $null
+    if (-not (Test-RegexPattern $pattern ([ref]$regexErr))) {
+        return @{ Ok = $false; Message = "Server chat username regex is invalid: $regexErr" }
+    }
+    if ($username -match $pattern) { return @{ Ok = $true } }
+    return @{
+        Ok      = $false
+        Message = "Username does not match the required pattern."
     }
 }
 
@@ -887,6 +910,7 @@ function Get-ServerSettingsObject {
         uploadWindowEnabled  = [bool]$script:ServerSettings.UploadWindowEnabled
         uploadWindowStart    = Get-UploadWindowPart $script:ServerSettings.UploadWindowStart
         uploadWindowEnd      = Get-UploadWindowPart $script:ServerSettings.UploadWindowEnd
+        chatUsernameRegex    = $script:ServerSettings.ChatUsernameRegex
     }
 }
 
@@ -898,6 +922,14 @@ if (-not [string]::IsNullOrWhiteSpace($UploadFileRegex)) {
     $regexStartupErr = $null
     if (-not (Test-RegexPattern $UploadFileRegex ([ref]$regexStartupErr))) {
         Write-ServerLog "Invalid -UploadFileRegex: $regexStartupErr" -Level Error
+        exit 1
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ChatUsernameRegex)) {
+    $chatRegexStartupErr = $null
+    if (-not (Test-RegexPattern $ChatUsernameRegex ([ref]$chatRegexStartupErr))) {
+        Write-ServerLog "Invalid -ChatUsernameRegex: $chatRegexStartupErr" -Level Error
         exit 1
     }
 }
@@ -1003,6 +1035,16 @@ function Set-ServerSettingsFromJson([string]$json, [ref]$errorMsg) {
         Write-ServerLog "Upload window: $(Format-UploadWindowDisplay $ws) → $(Format-UploadWindowDisplay $we)" -Level Info
     } else {
         Write-ServerLog "Upload time window disabled" -Level Info
+    }
+    if ($null -ne $data.PSObject.Properties['chatUsernameRegex']) {
+        $chatPattern = [string]$data.chatUsernameRegex
+        $chatRegexErr = $null
+        if (-not (Test-RegexPattern $chatPattern ([ref]$chatRegexErr))) {
+            $errorMsg.Value = "Invalid chat username regex: $chatRegexErr"
+            return $false
+        }
+        $script:ServerSettings.ChatUsernameRegex = $chatPattern
+        Write-ServerLog "Chat username regex updated: $(if ($chatPattern) { $chatPattern } else { '(none)' })" -Level Info
     }
     Write-ServerLog "Settings applied — folder: $($script:ServerSettings.UploadFolder)" -Level Ok
     return $true
@@ -1207,6 +1249,13 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
           <span class="regex-requirement-label">Filenames must match</span>
           <code class="regex-requirement-pattern">$pat</code>
         </div>
+"@
+    }
+    $chatRegexHintHtml = ""
+    if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) {
+        $chatPat = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.ChatUsernameRegex)
+        $chatRegexHintHtml = @"
+        <div class="chat-regex-hint">Name must match: <code>$chatPat</code></div>
 "@
     }
     $maxSizeHintHtml = ""
@@ -1441,9 +1490,12 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   .chat-widget-toggle { color: var(--muted); font-family: var(--mono); font-size: .8rem; }
   .chat-widget-body { display: none; }
   .chat-widget.open .chat-widget-body { display: block; }
-  .chat-widget-name-row { display: flex; align-items: center; gap: .6rem; padding: .9rem 1.2rem; border-bottom: 1px solid var(--border); }
+  .chat-widget-name-row { display: flex; align-items: center; gap: .6rem; padding: .9rem 1.2rem; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .chat-widget-name-row label { margin: 0; flex-shrink: 0; }
   .chat-widget-name-row input[type=text] { max-width: 220px; }
+  .chat-regex-hint { font-family: var(--mono); font-size: .72rem; color: var(--muted); width: 100%; }
+  .chat-regex-hint code { color: var(--accent2); }
+  .chat-widget-error { padding: .5rem 1.2rem; color: var(--danger); font-size: .8rem; font-family: var(--mono); }
   .chat-widget-msgs {
     max-height: 280px; overflow-y: auto; padding: 1rem 1.2rem;
     display: flex; flex-direction: column; gap: .6rem;
@@ -1535,10 +1587,12 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
       <div class="chat-widget-name-row">
         <label for="chatName" style="margin:0;">Name</label>
         <input type="text" id="chatName" placeholder="Your name" maxlength="40">
+        $chatRegexHintHtml
       </div>
       <div class="chat-widget-msgs" id="chatWidgetMsgs">
         <div class="chat-widget-empty">No messages yet — say hello!</div>
       </div>
+      <div class="chat-widget-error" id="chatWidgetError" style="display:none;"></div>
       <div class="chat-widget-input-row">
         <input type="text" id="chatWidgetInput" placeholder="Type a message&hellip;" maxlength="4000">
         <button type="button" class="btn" onclick="sendChatMessage()">Send</button>
@@ -1947,6 +2001,7 @@ function sendChatMessage() {
   var text = input.value.trim();
   if (!text) return;
   var name = document.getElementById('chatName').value.trim();
+  var errEl = document.getElementById('chatWidgetError');
   localStorage.setItem('chatName', name);
   fetch('/chat/send', {
     method: 'POST',
@@ -1954,10 +2009,14 @@ function sendChatMessage() {
     body: JSON.stringify({ cid: chatCid, username: name, message: text })
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (d.ok) {
+      errEl.style.display = 'none';
       if (d.cid && d.cid !== chatCid) { chatCid = d.cid; localStorage.setItem('chatCid', chatCid); }
       input.value = '';
       renderChatMessages([d.message], true);
       if (!chatPollTimer) chatPollTimer = setInterval(pollChatWidget, 3000);
+    } else {
+      errEl.textContent = d.error || 'Could not send message.';
+      errEl.style.display = 'block';
     }
   }).catch(function() {});
 }
@@ -2581,7 +2640,9 @@ function Get-ChatPage {
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
     display: flex; flex-direction: column; overflow: hidden;
   }
-  .chat-conv-head { padding: 1rem 1.2rem; border-bottom: 1px solid var(--border); font-weight: 700; }
+  .chat-conv-head { padding: .8rem 1.2rem; border-bottom: 1px solid var(--border); }
+  .chat-conv-head-name { font-weight: 700; }
+  .chat-conv-head-meta { font-family: var(--mono); font-size: .72rem; color: var(--muted); margin-top: .2rem; }
   .chat-conv-body { flex: 1; overflow-y: auto; padding: 1.2rem; display: flex; flex-direction: column; gap: .7rem; }
   .chat-conv-empty { color: var(--muted); font-family: var(--mono); font-size: .85rem; margin: auto; }
   .chat-bubble { max-width: 72%; padding: .6rem .9rem; border-radius: var(--radius); font-size: .9rem; line-height: 1.4; word-wrap: break-word; }
@@ -2608,7 +2669,10 @@ function Get-ChatPage {
       <div class="chat-thread-empty">Loading&hellip;</div>
     </div>
     <div class="chat-conv">
-      <div class="chat-conv-head" id="chatConvHead">Select a conversation</div>
+      <div class="chat-conv-head" id="chatConvHead">
+        <div class="chat-conv-head-name" id="chatConvHeadName">Select a conversation</div>
+        <div class="chat-conv-head-meta" id="chatConvHeadMeta"></div>
+      </div>
       <div class="chat-conv-body" id="chatConvBody"><div class="chat-conv-empty">No conversation selected.</div></div>
       <div class="chat-conv-input">
         <input type="text" id="chatReplyInput" placeholder="Type a reply&hellip;" disabled>
@@ -2664,18 +2728,18 @@ function renderMessages(msgs, append) {
 function openThread(cid) {
   activeCid = cid;
   lastMsgId = 0;
-  document.getElementById('chatConvHead').textContent = 'Conversation';
+  document.getElementById('chatConvHeadName').textContent = 'Conversation';
+  document.getElementById('chatConvHeadMeta').textContent = 'ID: ' + cid;
   document.getElementById('chatReplyInput').disabled = false;
   document.getElementById('chatReplyBtn').disabled = false;
   fetch('/chat/messages?cid=' + encodeURIComponent(cid) + '&since=0').then(function(r) { return r.json(); }).then(function(d) {
     if (d.ok) {
       renderMessages(d.messages, false);
-      if (d.messages.length) {
-        var last = d.messages[d.messages.length - 1];
-        document.getElementById('chatConvHead').textContent = last.from === 'admin' ? 'Conversation' : (last.username || 'Conversation');
-      }
       var userMsg = d.messages.slice().reverse().find(function(m) { return m.from === 'user'; });
-      if (userMsg) document.getElementById('chatConvHead').textContent = userMsg.username;
+      if (userMsg) {
+        document.getElementById('chatConvHeadName').textContent = userMsg.username;
+        document.getElementById('chatConvHeadMeta').textContent = 'IP: ' + userMsg.ip + '  \u00b7  ID: ' + cid;
+      }
     }
   }).catch(function() {});
   pollThreads();
@@ -2684,7 +2748,14 @@ function openThread(cid) {
 function pollActiveThread() {
   if (!activeCid) return;
   fetch('/chat/messages?cid=' + encodeURIComponent(activeCid) + '&since=' + lastMsgId).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.ok && d.messages.length) renderMessages(d.messages, true);
+    if (d.ok && d.messages.length) {
+      renderMessages(d.messages, true);
+      var userMsg = d.messages.slice().reverse().find(function(m) { return m.from === 'user'; });
+      if (userMsg) {
+        document.getElementById('chatConvHeadName').textContent = userMsg.username;
+        document.getElementById('chatConvHeadMeta').textContent = 'IP: ' + userMsg.ip + '  \u00b7  ID: ' + activeCid;
+      }
+    }
   }).catch(function() {});
 }
 
@@ -2724,6 +2795,7 @@ setInterval(pollActiveThread, 3000);
 # ────────────────────────────────────────────────────────────────────────
 function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     $regexVal   = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFileRegex)
+    $chatRegexVal = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.ChatUsernameRegex)
     $folderVal  = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFolder)
     $passwordVal = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.Password)
     $maxMbVal = if ($script:ServerSettings.MaxUploadSize -gt 0) {
@@ -2731,6 +2803,7 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     } else { "0" }
     $ipWhitelistVal = [System.Net.WebUtility]::HtmlEncode(($script:ServerSettings.UploadIPWhitelist -join ', '))
     $regexStatusBadge    = if ([string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) { "Disabled" } else { "Active" }
+    $chatRegexStatusBadge = if ([string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) { "Disabled" } else { "Active" }
     $passwordStatusBadge = if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) { "Unsecured" } else { "Protected" }
     $folderStatusBadge   = "Configured"
     $maxSizeStatusBadge  = if ($script:ServerSettings.MaxUploadSize -gt 0) { (Format-ByteSize $script:ServerSettings.MaxUploadSize) } else { "Unlimited" }
@@ -2996,6 +3069,29 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     </div>
 
     <div class="setting-group">
+      <button class="setting-header" type="button" onclick="toggleSetting('set-chatregex')" aria-expanded="true">
+        <span class="setting-icon">&#128172;</span>
+        <span class="setting-title">Chat username regex</span>
+        <span class="setting-status $(if ([string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) { 'warn' })" id="status-chatregex">$chatRegexStatusBadge</span>
+        <span class="setting-chevron" id="chev-set-chatregex">&#9650;</span>
+      </button>
+      <div class="setting-body" id="set-chatregex">
+        <p class="setting-help">
+          When set, chat usernames must match this .NET regex pattern or the message is rejected.
+          Leave empty to allow any username. Example: <code>^[A-Za-z0-9 ]{2,20}$</code>
+          Test patterns on <a href="https://regex101.com/" target="_blank" rel="noopener noreferrer">regex101.com</a>
+          (select the <strong>.NET</strong> flavor).
+        </p>
+        <div class="label-row">
+          <label for="chatUsernameRegex">Pattern</label>
+          <a href="https://regex101.com/" target="_blank" rel="noopener noreferrer" class="regex-help-link"
+             title="Open regex101.com to test .NET patterns">?</a>
+        </div>
+        <input type="text" id="chatUsernameRegex" name="chatUsernameRegex" placeholder="e.g. ^[A-Za-z0-9 ]{2,20}$" value="$chatRegexVal" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+
+    <div class="setting-group">
       <button class="setting-header" type="button" onclick="toggleSetting('set-maxsize')" aria-expanded="true">
         <span class="setting-icon">&#128230;</span>
         <span class="setting-title">Max upload size</span>
@@ -3129,6 +3225,12 @@ function updateStatusBadges(s) {
     var regexOn = !!(s.uploadFileRegex && s.uploadFileRegex.trim());
     regexEl.textContent = regexOn ? 'Active' : 'Disabled';
     regexEl.classList.toggle('warn', !regexOn);
+  }
+  var chatRegexEl = document.getElementById('status-chatregex');
+  if (chatRegexEl) {
+    var chatRegexOn = !!(s.chatUsernameRegex && s.chatUsernameRegex.trim());
+    chatRegexEl.textContent = chatRegexOn ? 'Active' : 'Disabled';
+    chatRegexEl.classList.toggle('warn', !chatRegexOn);
   }
   if (pwEl) {
     var secured = !!(s.password && String(s.password).length);
@@ -3276,6 +3378,7 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
   try {
     const payload = {
       uploadFileRegex: document.getElementById('uploadFileRegex').value,
+      chatUsernameRegex: document.getElementById('chatUsernameRegex').value,
       uploadFolder: document.getElementById('uploadFolder').value,
       password: document.getElementById('downloadPassword').value,
       maxUploadSize: mbToBytes(document.getElementById('maxUploadSizeMb').value),
@@ -3295,6 +3398,7 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
     }
     if (data.settings) {
       document.getElementById('uploadFileRegex').value = data.settings.uploadFileRegex || '';
+      document.getElementById('chatUsernameRegex').value = data.settings.chatUsernameRegex || '';
       document.getElementById('uploadFolder').value = data.settings.uploadFolder || '';
       document.getElementById('downloadPassword').value = data.settings.password || '';
       document.getElementById('maxUploadSizeMb').value = bytesToMbStr(data.settings.maxUploadSize);
@@ -3731,6 +3835,9 @@ Write-Host "  Admin Page    : http://127.0.0.1:$Port/admin  (localhost only)" -F
 if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) {
   Write-Host "  Upload Regex  : $($script:ServerSettings.UploadFileRegex)" -ForegroundColor DarkCyan
 }
+if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) {
+  Write-Host "  Chat Name Regex: $($script:ServerSettings.ChatUsernameRegex)" -ForegroundColor DarkCyan
+}
 if ($script:ServerSettings.MaxUploadSize -gt 0) {
   Write-Host "  Max Upload    : $(Format-ByteSize $script:ServerSettings.MaxUploadSize)" -ForegroundColor DarkCyan
 } else {
@@ -3894,7 +4001,11 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             $text = $text.Trim()
             if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) }
 
-            if ($text.Length -eq 0) {
+            $nameCheck = Test-ChatUsername $name
+            if (-not $nameCheck.Ok) {
+                $payload = (@{ ok = $false; error = $nameCheck.Message } | ConvertTo-Json -Compress -Depth 2)
+                Send-Response $ctx $payload -status 400 -contentType "application/json; charset=utf-8"
+            } elseif ($text.Length -eq 0) {
                 Send-Response $ctx '{"ok":false,"error":"Message is empty."}' -status 400 -contentType "application/json; charset=utf-8"
             } else {
                 $ip  = $req.RemoteEndPoint.Address.ToString()
@@ -4043,6 +4154,7 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                         maxUploadSize       = $s.maxUploadSize
                         uploadIPWhitelist   = $s.uploadIPWhitelist
                         uploadWindowEnabled = $s.uploadWindowEnabled
+                        chatUsernameRegex   = $s.chatUsernameRegex
                     } | ConvertTo-Json -Compress -Depth 2)
                     $innerJson = $innerJson.TrimEnd('}') + ',' +
                         '"uploadWindowStart":' + $winStartJson + ',' +
@@ -4280,6 +4392,7 @@ function New-RequestRunspacePool {
         'Get-ChatDataFile',
         'Save-ChatStoreToDisk',
         'Test-ChatCid',
+        'Test-ChatUsername',
         'Add-ChatMessage',
         'Get-ChatMessagesForCid',
         'Get-ChatThreadsSummary',
