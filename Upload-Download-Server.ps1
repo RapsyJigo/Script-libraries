@@ -209,12 +209,41 @@ $script:ServerSettings = @{
 }
 
 # ────────────────────────────────────────────────────────────────────────
-# >> Elevation check
+# >> Elevation check (cross-platform)
 # ────────────────────────────────────────────────────────────────────────
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-ServerLog "Not running as Administrator" -Level Warn
-    Write-ServerLog "Please restart as administrator"
+# $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+; on Windows PowerShell 5.1
+# they're undefined, but 5.1 only ever runs on Windows anyway.
+$script:OnWindows = if ($PSVersionTable.PSVersion.Major -ge 6) { [bool]$IsWindows } else { $true }
+$script:OnMacOS   = if ($PSVersionTable.PSVersion.Major -ge 6) { [bool]$IsMacOS } else { $false }
+$script:OnLinux   = if ($PSVersionTable.PSVersion.Major -ge 6) { [bool]$IsLinux } else { $false }
+$script:PlatformName = if ($script:OnWindows) { "Windows" } elseif ($script:OnMacOS) { "macOS" } else { "Linux" }
+
+$isElevated = $false
+if ($script:OnWindows) {
+    try {
+        $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        $isElevated = $false
+    }
+} else {
+    # Linux/macOS: elevated means running as root (effective UID 0).
+    try {
+        $uidOutput = & id -u 2>$null
+        $isElevated = ($LASTEXITCODE -eq 0 -and $uidOutput.Trim() -eq '0')
+    } catch {
+        $isElevated = $false
+    }
+}
+
+if (-not $isElevated) {
+    $elevateHint = if ($script:OnWindows) {
+        "Please restart as Administrator (right-click PowerShell -> 'Run as administrator')."
+    } else {
+        "Please restart with elevated privileges, e.g. 'sudo pwsh -File `"$PSCommandPath`"'."
+    }
+    Write-ServerLog "Not running with elevated privileges on $($script:PlatformName)" -Level Warn
+    Write-ServerLog $elevateHint
     Write-ServerLog "Auto closing in 30 seconds"
     Start-Sleep -Seconds 30
     exit
@@ -285,6 +314,33 @@ function Get-SessionCookieAttributes([System.Net.HttpListenerRequest]$req) {
 function Test-IsLocalRequest([System.Net.HttpListenerRequest]$req) {
     if (-not $req.RemoteEndPoint) { return $false }
     return [System.Net.IPAddress]::IsLoopback($req.RemoteEndPoint.Address)
+}
+
+function Get-LocalIPv4Addresses {
+    # Cross-platform LAN IP discovery via .NET (works on Windows/Linux/macOS) —
+    # replaces the Windows-only Get-NetIPConfiguration cmdlet.
+    try {
+        $nics = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object {
+                $_.OperationalStatus -eq [System.Net.NetworkInformation.OperationalStatus]::Up -and
+                $_.NetworkInterfaceType -ne [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback
+            }
+        # Prefer interfaces with a default gateway (i.e. "real" LAN/Wi-Fi adapters),
+        # but fall back to any up, non-loopback interface if none report one.
+        $withGateway = @($nics | Where-Object { $_.GetIPProperties().GatewayAddresses.Count -gt 0 })
+        $source = if ($withGateway.Count -gt 0) { $withGateway } else { $nics }
+        $addrs = foreach ($nic in $source) {
+            foreach ($ua in $nic.GetIPProperties().UnicastAddresses) {
+                if ($ua.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                    $ua.Address.ToString()
+                }
+            }
+        }
+        return @($addrs | Select-Object -Unique)
+    } catch {
+        Write-ServerLog "Get-LocalIPv4Addresses: could not enumerate network interfaces — $($_.Exception.Message)" -Level Warn
+        return @()
+    }
 }
 
 # ────────────────────────────────────────────────────────────────────────
@@ -3739,6 +3795,13 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
 # >> HTTP Server
 # ────────────────────────────────────────────────────────────────────────
 function Add-ServerFirewallRule {
+    if (-not $script:OnWindows) {
+        # Not attempting to handle every possible Linux/macOS firewall (ufw, firewalld,
+        # nftables, pf, etc.) — just let the person know they may need to open it themselves.
+        Write-ServerLog "Firewall: automatic rule creation is only supported on Windows." -Level Warn
+        Write-ServerLog "If a local firewall is enabled, please allow inbound TCP traffic on port $Port yourself."
+        return
+    }
     try {
         $existing = Get-NetFirewallRule -DisplayName $script:FirewallRuleName -ErrorAction SilentlyContinue
         if ($existing) {
@@ -3749,7 +3812,8 @@ function Add-ServerFirewallRule {
         $script:FirewallRuleCreated = $true
         Write-ServerLog "Firewall: added TCP inbound rule for port $Port" -Level Info
     } catch {
-        Write-ServerLog "Firewall: could not create TCP port rule — $($_.Exception.Message)" -Level Warn
+        Write-ServerLog "Firewall: could not create TCP port rule automatically — $($_.Exception.Message)" -Level Warn
+        Write-ServerLog "Please allow inbound TCP traffic on port $Port yourself via Windows Defender Firewall."
     }
 }
 
@@ -3799,8 +3863,8 @@ try {
     exit 1
 }
 
-$privateIP = (Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne "Disconnected"}).IPv4Address.IPAddress
-$script:ServerSettings.PrivateIP = if ($privateIP -is [array]) { $privateIP[0] } else { [string]$privateIP }
+$privateIP = Get-LocalIPv4Addresses
+$script:ServerSettings.PrivateIP = if ($privateIP.Count -gt 0) { $privateIP[0] } else { "" }
 $publicIP = "No Internet"
 try {
   $publicIP  = (Invoke-WebRequest ifconfig.me/ip -UseBasicParsing).Content.Trim()
