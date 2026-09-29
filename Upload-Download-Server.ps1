@@ -38,11 +38,15 @@
   Optional upload window end (local time). ISO-8601 or "yyyy-MM-dd HH:mm". Empty = no end limit.
   Can also be changed live on /admin (localhost only).
 
+.PARAMETER ChatUsernameRegex
+  Optional regex pattern chat usernames (from the /chat widget on the upload page) must match.
+  Empty string disables validation. Can also be changed live on /admin (localhost only).
+
 .EXAMPLE
   .\Upload-Download-Server.ps1
   .\Upload-Download-Server.ps1 -Port 9090 -Password "s3cr3t!" -UploadFolder "C:\shared"
   .\Upload-Download-Server.ps1 -UploadFileRegex '\.(pdf|docx)$'
-  .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00"
+  .\Upload-Download-Server.ps1 -Port 80 -Password "testing" -UploadFolder ".\uploads" -UploadFileRegex "\.(pdf|docx)" -UploadIPWhitelist "192.168.10.10, 192.168.10.11" -UploadWindowStart "2026.06.05 09:00" -UploadwindowEnd "2026.06.05 12:00" -ChatUsernameRegex "^[A-Za-z0-9 ]{2,20}$"
 #>
 param(
     [Parameter(Mandatory = $false, HelpMessage = "The port on which the server will be opened. Must have no other processes using this port.")]
@@ -72,10 +76,16 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Upload window end (local). Empty = no end limit.")]
     [AllowEmptyString()]
-    [string] $UploadWindowEnd = ""
+    [string] $UploadWindowEnd = "",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Regex pattern chat usernames must match. Empty = no restriction.")]
+    [AllowEmptyString()]
+    [string] $ChatUsernameRegex = ""
 )
 
-# ── Setup ────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Setup
+# ────────────────────────────────────────────────────────────────────────
 $ErrorActionPreference = "Stop"
 
 function Write-ServerLog {
@@ -195,13 +205,45 @@ $script:ServerSettings = @{
     UploadWindowEnd      = $parsedWindowEnd
     Port                 = $Port
     PrivateIP            = ""
+    ChatUsernameRegex    = $ChatUsernameRegex
 }
 
-# ── Self-Elevation ───────────────────────────────────────────────────────────
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-ServerLog "Not running as Administrator" -Level Warn
-    Write-ServerLog "Please restart as administrator"
+# ────────────────────────────────────────────────────────────────────────
+# >> Elevation check (cross-platform)
+# ────────────────────────────────────────────────────────────────────────
+# $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+; on Windows PowerShell 5.1
+# they're undefined, but 5.1 only ever runs on Windows anyway.
+$script:OnWindows = if ($PSVersionTable.PSVersion.Major -ge 6) { [bool]$IsWindows } else { $true }
+$script:OnMacOS   = if ($PSVersionTable.PSVersion.Major -ge 6) { [bool]$IsMacOS } else { $false }
+$script:OnLinux   = if ($PSVersionTable.PSVersion.Major -ge 6) { [bool]$IsLinux } else { $false }
+$script:PlatformName = if ($script:OnWindows) { "Windows" } elseif ($script:OnMacOS) { "macOS" } else { "Linux" }
+
+$isElevated = $false
+if ($script:OnWindows) {
+    try {
+        $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        $isElevated = $false
+    }
+} else {
+    # Linux/macOS: elevated means running as root (effective UID 0).
+    try {
+        $uidOutput = & id -u 2>$null
+        $isElevated = ($LASTEXITCODE -eq 0 -and $uidOutput.Trim() -eq '0')
+    } catch {
+        $isElevated = $false
+    }
+}
+
+if (-not $isElevated) {
+    $elevateHint = if ($script:OnWindows) {
+        "Please restart as Administrator (right-click PowerShell -> 'Run as administrator')."
+    } else {
+        "Please restart with elevated privileges, e.g. 'sudo pwsh -File `"$PSCommandPath`"'."
+    }
+    Write-ServerLog "Not running with elevated privileges on $($script:PlatformName)" -Level Warn
+    Write-ServerLog $elevateHint
     Write-ServerLog "Auto closing in 30 seconds"
     Start-Sleep -Seconds 30
     exit
@@ -225,6 +267,9 @@ $script:AllSendersZipCache = @{
     BuiltAt     = $null
 }
 $script:AllSendersZipLock = [object]::new()
+
+$script:ChatMessages = [System.Collections.Generic.List[object]]::new()
+$script:ChatLock = [object]::new()
 
 $script:FirewallRuleName = "ScriptLibs-UploadDownloadServer-TCP-$Port"
 $script:FirewallRuleCreated = $false
@@ -271,6 +316,149 @@ function Test-IsLocalRequest([System.Net.HttpListenerRequest]$req) {
     return [System.Net.IPAddress]::IsLoopback($req.RemoteEndPoint.Address)
 }
 
+function Get-LocalIPv4Addresses {
+    # Cross-platform LAN IP discovery via .NET (works on Windows/Linux/macOS) —
+    # replaces the Windows-only Get-NetIPConfiguration cmdlet.
+    try {
+        $nics = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object {
+                $_.OperationalStatus -eq [System.Net.NetworkInformation.OperationalStatus]::Up -and
+                $_.NetworkInterfaceType -ne [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback
+            }
+        # Prefer interfaces with a default gateway (i.e. "real" LAN/Wi-Fi adapters),
+        # but fall back to any up, non-loopback interface if none report one.
+        $withGateway = @($nics | Where-Object { $_.GetIPProperties().GatewayAddresses.Count -gt 0 })
+        $source = if ($withGateway.Count -gt 0) { $withGateway } else { $nics }
+        $addrs = foreach ($nic in $source) {
+            foreach ($ua in $nic.GetIPProperties().UnicastAddresses) {
+                if ($ua.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                    $ua.Address.ToString()
+                }
+            }
+        }
+        return @($addrs | Select-Object -Unique)
+    } catch {
+        Write-ServerLog "Get-LocalIPv4Addresses: could not enumerate network interfaces — $($_.Exception.Message)" -Level Warn
+        return @()
+    }
+}
+
+# ────────────────────────────────────────────────────────────────────────
+# >> Chat store (flat-file JSON "database", in-memory mirror for speed)
+# ────────────────────────────────────────────────────────────────────────
+function Get-ChatDataDir {
+    $dir = Join-Path $script:ServerSettings.UploadFolder '_chat'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    return $dir
+}
+
+function Get-ChatDataFile {
+    return Join-Path (Get-ChatDataDir) 'messages.json'
+}
+
+function Initialize-ChatStore {
+    # Loads any persisted messages from disk into the shared in-memory list.
+    # Must run BEFORE the runspace pool is created so every runspace sees the same list instance.
+    $file = Get-ChatDataFile
+    $script:ChatMessages.Clear()
+    if (Test-Path -LiteralPath $file) {
+        try {
+            $raw = Get-Content -LiteralPath $file -Raw -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $items = @(ConvertFrom-Json $raw -ErrorAction Stop)
+                foreach ($item in $items) {
+                    $script:ChatMessages.Add([hashtable]@{
+                        id       = [int64]$item.id
+                        cid      = [string]$item.cid
+                        from     = [string]$item.from
+                        username = [string]$item.username
+                        text     = [string]$item.text
+                        ip       = [string]$item.ip
+                        ts       = [int64]$item.ts
+                    })
+                }
+            }
+        } catch {
+            Write-ServerLog "Failed to load chat history from '$file': $($_.Exception.Message)" -Level Warn
+        }
+    }
+}
+
+function Save-ChatStoreToDisk {
+    # Caller must already hold $script:ChatLock.
+    $file = Get-ChatDataFile
+    try {
+        $json = @($script:ChatMessages) | ConvertTo-Json -Depth 4 -Compress
+        Set-Content -LiteralPath $file -Value $json -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-ServerLog "Failed to save chat history to '$file': $($_.Exception.Message)" -Level Warn
+    }
+}
+
+function Test-ChatCid([string]$cid) {
+    return (-not [string]::IsNullOrEmpty($cid)) -and ($cid -match '^[A-Za-z0-9\-]{8,64}$')
+}
+
+function Add-ChatMessage([string]$cid, [string]$from, [string]$username, [string]$text, [string]$ip) {
+    [System.Threading.Monitor]::Enter($script:ChatLock)
+    try {
+        $nextId = 1
+        if ($script:ChatMessages.Count -gt 0) {
+            $nextId = [int64]($script:ChatMessages[$script:ChatMessages.Count - 1].id) + 1
+        }
+        $msg = [hashtable]@{
+            id       = $nextId
+            cid      = $cid
+            from     = $from
+            username = $username
+            text     = $text
+            ip       = $ip
+            ts       = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        }
+        $script:ChatMessages.Add($msg)
+        Save-ChatStoreToDisk
+        return $msg
+    } finally {
+        [System.Threading.Monitor]::Exit($script:ChatLock)
+    }
+}
+
+function Get-ChatMessagesForCid([string]$cid, [int64]$sinceId = 0) {
+    [System.Threading.Monitor]::Enter($script:ChatLock)
+    try {
+        return @($script:ChatMessages | Where-Object { $_.cid -eq $cid -and [int64]$_.id -gt $sinceId } | Sort-Object { [int64]$_.id })
+    } finally {
+        [System.Threading.Monitor]::Exit($script:ChatLock)
+    }
+}
+
+function Get-ChatThreadsSummary {
+    [System.Threading.Monitor]::Enter($script:ChatLock)
+    try {
+        $groups = $script:ChatMessages | Group-Object -Property cid
+        $threads = foreach ($g in $groups) {
+            $sorted = @($g.Group | Sort-Object { [int64]$_.id })
+            $last = $sorted[-1]
+            $lastUserMsg = @($sorted | Where-Object { $_.from -eq 'user' })
+            $displayName = if ($lastUserMsg.Count -gt 0) { $lastUserMsg[-1].username } else { 'Anonymous' }
+            [pscustomobject]@{
+                cid      = $g.Name
+                username = $displayName
+                ip       = $last.ip
+                lastText = $last.text
+                lastFrom = $last.from
+                lastTs   = [int64]$last.ts
+                unread   = ($last.from -eq 'user')
+            }
+        }
+        return @($threads | Sort-Object -Property lastTs -Descending)
+    } finally {
+        [System.Threading.Monitor]::Exit($script:ChatLock)
+    }
+}
+
 function Test-RegexPattern([string]$pattern, [ref]$errorMsg) {
     $errorMsg.Value = $null
     if ([string]::IsNullOrWhiteSpace($pattern)) { return $true }
@@ -295,6 +483,20 @@ function Test-UploadFileName([string]$fileName) {
     return @{
         Ok      = $false
         Message = "File name does not match the required pattern. Rejected: $baseName"
+    }
+}
+
+function Test-ChatUsername([string]$username) {
+    $pattern = $script:ServerSettings.ChatUsernameRegex
+    if ([string]::IsNullOrWhiteSpace($pattern)) { return @{ Ok = $true } }
+    $regexErr = $null
+    if (-not (Test-RegexPattern $pattern ([ref]$regexErr))) {
+        return @{ Ok = $false; Message = "Server chat username regex is invalid: $regexErr" }
+    }
+    if ($username -match $pattern) { return @{ Ok = $true } }
+    return @{
+        Ok      = $false
+        Message = "Username does not match the required pattern."
     }
 }
 
@@ -764,6 +966,7 @@ function Get-ServerSettingsObject {
         uploadWindowEnabled  = [bool]$script:ServerSettings.UploadWindowEnabled
         uploadWindowStart    = Get-UploadWindowPart $script:ServerSettings.UploadWindowStart
         uploadWindowEnd      = Get-UploadWindowPart $script:ServerSettings.UploadWindowEnd
+        chatUsernameRegex    = $script:ServerSettings.ChatUsernameRegex
     }
 }
 
@@ -775,6 +978,14 @@ if (-not [string]::IsNullOrWhiteSpace($UploadFileRegex)) {
     $regexStartupErr = $null
     if (-not (Test-RegexPattern $UploadFileRegex ([ref]$regexStartupErr))) {
         Write-ServerLog "Invalid -UploadFileRegex: $regexStartupErr" -Level Error
+        exit 1
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ChatUsernameRegex)) {
+    $chatRegexStartupErr = $null
+    if (-not (Test-RegexPattern $ChatUsernameRegex ([ref]$chatRegexStartupErr))) {
+        Write-ServerLog "Invalid -ChatUsernameRegex: $chatRegexStartupErr" -Level Error
         exit 1
     }
 }
@@ -881,11 +1092,23 @@ function Set-ServerSettingsFromJson([string]$json, [ref]$errorMsg) {
     } else {
         Write-ServerLog "Upload time window disabled" -Level Info
     }
+    if ($null -ne $data.PSObject.Properties['chatUsernameRegex']) {
+        $chatPattern = [string]$data.chatUsernameRegex
+        $chatRegexErr = $null
+        if (-not (Test-RegexPattern $chatPattern ([ref]$chatRegexErr))) {
+            $errorMsg.Value = "Invalid chat username regex: $chatRegexErr"
+            return $false
+        }
+        $script:ServerSettings.ChatUsernameRegex = $chatPattern
+        Write-ServerLog "Chat username regex updated: $(if ($chatPattern) { $chatPattern } else { '(none)' })" -Level Info
+    }
     Write-ServerLog "Settings applied — folder: $($script:ServerSettings.UploadFolder)" -Level Ok
     return $true
 }
 
-# ── HTML Templates ───────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> HTML Templates
+# ────────────────────────────────────────────────────────────────────────
 
 $CSS_SHARED = @'
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap');
@@ -1008,9 +1231,23 @@ $CSS_SHARED = @'
     position: absolute; top: 0; left: 0; right: 0; height: 3px;
     background: linear-gradient(90deg, var(--accent), var(--accent2));
   }
+  /* ── Mobile: stack the topbar (title / meta / nav) and let the page scroll normally ── */
+  @media (max-width: 600px) {
+    html, body { overflow: auto; }
+    .topbar {
+      position: static; height: auto; flex-direction: column; align-items: stretch;
+      padding: 1rem 1.2rem;
+    }
+    .topbar-title { text-align: center; }
+    .topbar-nav { flex-direction: column; align-items: stretch; width: 100%; gap: .5rem; margin-top: .3rem; }
+    .topbar-nav a { text-align: center; }
+    .page { position: static; padding: 1.2rem; }
+  }
 '@
 
-# ── Upload Page ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Upload Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlocked = $false, [string]$clientIP = "") {
     $msgHtml = ""
     if ($msg) {
@@ -1040,7 +1277,9 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
 "@
     }
 
-    # ── IP-blocked banner (shown instead of the normal message area) ──────────
+# ────────────────────────────────────────────────────────────────────────
+# >> IP-blocked banner (shown instead of the normal message area)
+# ────────────────────────────────────────────────────────────────────────
     $blockedBannerHtml = ""
     $blockedJs         = "false"
     if ($ipBlocked) {
@@ -1068,6 +1307,13 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
         </div>
 "@
     }
+    $chatRegexHintHtml = ""
+    if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) {
+        $chatPat = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.ChatUsernameRegex)
+        $chatRegexHintHtml = @"
+        <div class="chat-regex-hint">Name must match: <code>$chatPat</code></div>
+"@
+    }
     $maxSizeHintHtml = ""
     $maxUploadJs = '0'
     if ($script:ServerSettings.MaxUploadSize -gt 0) {
@@ -1093,7 +1339,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     width: 100%;
     max-width: 1400px;
     margin: 0 auto;
-    height: 100%;
+    height: auto;
     align-items: start;
     min-width: 0;
   }
@@ -1102,7 +1348,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   }
   .upload-panel {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 16px; padding: 2rem;
+    border-radius: 16px; padding: 1.6rem;
     position: sticky; top: 0;
     min-width: 0; width: 100%;
   }
@@ -1114,7 +1360,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   .upload-panel { position: relative; overflow: hidden; }
   .drop-zone {
     border: 2px dashed var(--border); border-radius: var(--radius);
-    padding: 2.5rem 1rem; text-align: center; cursor: pointer;
+    padding: 1.7rem 1rem; text-align: center; cursor: pointer;
     transition: border-color .2s, background .2s; margin-top: 1.2rem;
     background: transparent;
   }
@@ -1198,7 +1444,7 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
   .filelist-panel {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 16px; padding: 1.5rem 2rem;
-    min-height: 300px; min-width: 0; width: 100%; overflow: hidden;
+    min-height: 220px; min-width: 0; width: 100%; overflow: hidden;
   }
   .filelist-header {
     display: flex; align-items: center; justify-content: space-between;
@@ -1287,6 +1533,37 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     color: var(--accent2); letter-spacing: .04em;
   }
   .time-window-banner.locked .time-window-countdown { color: var(--danger); }
+  /* ── Chat widget ── */
+  .chat-widget {
+    max-width: 900px; margin: 1.4rem auto 0; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  }
+  .chat-widget-head {
+    display: flex; align-items: center; justify-content: space-between; gap: .8rem;
+    padding: .9rem 1.2rem; border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .chat-widget-head-title { font-weight: 700; }
+  .chat-widget-toggle { color: var(--muted); font-family: var(--mono); font-size: .8rem; }
+  .chat-widget-body { display: none; }
+  .chat-widget.open .chat-widget-body { display: block; }
+  .chat-widget-name-row { display: flex; align-items: center; gap: .6rem; padding: .9rem 1.2rem; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .chat-widget-name-row label { margin: 0; flex-shrink: 0; }
+  .chat-widget-name-row input[type=text] { max-width: 220px; }
+  .chat-regex-hint { font-family: var(--mono); font-size: .72rem; color: var(--muted); width: 100%; }
+  .chat-regex-hint code { color: var(--accent2); }
+  .chat-widget-error { padding: .5rem 1.2rem; color: var(--danger); font-size: .8rem; font-family: var(--mono); }
+  .chat-widget-msgs {
+    max-height: 280px; overflow-y: auto; padding: 1rem 1.2rem;
+    display: flex; flex-direction: column; gap: .6rem;
+  }
+  .chat-widget-empty { color: var(--muted); font-family: var(--mono); font-size: .82rem; }
+  .chat-widget-bubble { max-width: 78%; padding: .55rem .85rem; border-radius: var(--radius); font-size: .88rem; line-height: 1.4; word-wrap: break-word; }
+  .chat-widget-bubble.mine { align-self: flex-end; background: var(--accent); color: #0d0d0f; }
+  .chat-widget-bubble.theirs { align-self: flex-start; background: var(--surface2); border: 1px solid var(--border); }
+  .chat-widget-bubble-meta { font-size: .65rem; font-family: var(--mono); opacity: .65; margin-top: .25rem; }
+  .chat-widget-input-row { display: flex; gap: .6rem; padding: 1rem 1.2rem; }
+  .chat-widget-input-row input[type=text] { flex: 1; }
+  .chat-widget-input-row button { width: auto; margin-top: 0; padding: .75rem 1.3rem; white-space: nowrap; }
 </style></head>
 <body>
 <div class="topbar">
@@ -1356,6 +1633,29 @@ function Get-UploadPage([string]$msg = "", [bool]$isError = $false, [bool]$ipBlo
     </div>
 
   </div>
+
+  <div class="chat-widget" id="chatWidget">
+    <div class="chat-widget-head" onclick="toggleChatWidget()">
+      <span class="chat-widget-head-title">&#128172; Message the admin</span>
+      <span class="chat-widget-toggle" id="chatWidgetToggle">Show &darr;</span>
+    </div>
+    <div class="chat-widget-body">
+      <div class="chat-widget-name-row">
+        <label for="chatName" style="margin:0;">Name</label>
+        <input type="text" id="chatName" placeholder="Your name" maxlength="40">
+        $chatRegexHintHtml
+      </div>
+      <div class="chat-widget-msgs" id="chatWidgetMsgs">
+        <div class="chat-widget-empty">No messages yet — say hello!</div>
+      </div>
+      <div class="chat-widget-error" id="chatWidgetError" style="display:none;"></div>
+      <div class="chat-widget-input-row">
+        <input type="text" id="chatWidgetInput" placeholder="Type a message&hellip;" maxlength="4000">
+        <button type="button" class="btn" onclick="sendChatMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -1695,27 +1995,124 @@ document.getElementById('uploadForm').addEventListener('submit', async function(
     window.location.href = '/?' + q;
   }, 1200);
 });
+
+// ── Chat widget ──
+var chatCid = localStorage.getItem('chatCid') || '';
+var chatLastId = 0;
+var chatPollTimer = null;
+
+(function initChatName() {
+  var saved = localStorage.getItem('chatName');
+  if (saved) document.getElementById('chatName').value = saved;
+})();
+document.getElementById('chatName').addEventListener('change', function() {
+  localStorage.setItem('chatName', this.value);
+});
+
+function toggleChatWidget() {
+  var w = document.getElementById('chatWidget');
+  var open = w.classList.toggle('open');
+  document.getElementById('chatWidgetToggle').textContent = open ? 'Hide \u2191' : 'Show \u2193';
+  if (open) {
+    loadChatHistory();
+    if (!chatPollTimer) chatPollTimer = setInterval(pollChatWidget, 3000);
+  }
+}
+
+function fmtChatTime(ts) {
+  var d = new Date(ts);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderChatMessages(msgs, append) {
+  var box = document.getElementById('chatWidgetMsgs');
+  if (!append) box.innerHTML = '';
+  if (!append && !msgs.length) { box.innerHTML = '<div class="chat-widget-empty">No messages yet \u2014 say hello!</div>'; }
+  msgs.forEach(function(m) {
+    chatLastId = Math.max(chatLastId, m.id);
+    var div = document.createElement('div');
+    div.className = 'chat-widget-bubble ' + (m.from === 'user' ? 'mine' : 'theirs');
+    div.innerHTML = escHtml(m.text) + '<div class="chat-widget-bubble-meta">' + (m.from === 'admin' ? 'Admin' : 'You') + ' \u00b7 ' + fmtChatTime(m.ts) + '</div>';
+    box.appendChild(div);
+  });
+  if (msgs.length) box.scrollTop = box.scrollHeight;
+}
+
+function loadChatHistory() {
+  if (!chatCid) return;
+  fetch('/chat/poll?cid=' + encodeURIComponent(chatCid) + '&since=0').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) renderChatMessages(d.messages, false);
+  }).catch(function() {});
+}
+
+function pollChatWidget() {
+  if (!chatCid) return;
+  fetch('/chat/poll?cid=' + encodeURIComponent(chatCid) + '&since=' + chatLastId).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok && d.messages.length) renderChatMessages(d.messages, true);
+  }).catch(function() {});
+}
+
+function sendChatMessage() {
+  var input = document.getElementById('chatWidgetInput');
+  var text = input.value.trim();
+  if (!text) return;
+  var name = document.getElementById('chatName').value.trim();
+  var errEl = document.getElementById('chatWidgetError');
+  localStorage.setItem('chatName', name);
+  fetch('/chat/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cid: chatCid, username: name, message: text })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      errEl.style.display = 'none';
+      if (d.cid && d.cid !== chatCid) { chatCid = d.cid; localStorage.setItem('chatCid', chatCid); }
+      input.value = '';
+      renderChatMessages([d.message], true);
+      if (!chatPollTimer) chatPollTimer = setInterval(pollChatWidget, 3000);
+    } else {
+      errEl.textContent = d.error || 'Could not send message.';
+      errEl.style.display = 'block';
+    }
+  }).catch(function() {});
+}
+
+document.getElementById('chatWidgetInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); sendChatMessage(); }
+});
+
+if (chatCid) {
+  document.getElementById('chatWidget').classList.add('open');
+  document.getElementById('chatWidgetToggle').textContent = 'Hide \u2191';
+  loadChatHistory();
+  chatPollTimer = setInterval(pollChatWidget, 3000);
+}
 </script>
 </body></html>
 "@
 }
 
-# ── Login Page ───────────────────────────────────────────────────────────────
-function Get-LoginPage([bool]$failed = $false) {
+# ────────────────────────────────────────────────────────────────────────
+# >> Login Page
+# ────────────────────────────────────────────────────────────────────────
+function Get-LoginPage([bool]$failed = $false, [string]$returnTo = "/download") {
     $errHtml = if ($failed) { "<div class='msg err'>&#10007;&nbsp; Incorrect password. Try again.</div>" } else { "" }
+    $safeReturnTo = if ($returnTo -eq "/chat") { "/chat" } else { "/download" }
+    $title = if ($safeReturnTo -eq "/chat") { "Chat" } else { "Download" }
     return @"
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Download — Sign In</title>
+<title>$title — Sign In</title>
 <style>$CSS_SHARED
   html, body { overflow: auto; }
 </style></head>
 <body style="display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem;">
 <div class="card">
-  <h1>Download <span class="badge">Protected</span></h1>
-  <p class="sub" style="margin-top:.3rem;margin-bottom:1.8rem;">Enter the password to access files</p>
+  <h1>$title <span class="badge">Protected</span></h1>
+  <p class="sub" style="margin-top:.3rem;margin-bottom:1.8rem;">Enter the password to access $(if ($safeReturnTo -eq '/chat') { 'chat' } else { 'files' })</p>
   <nav style="margin-bottom:1.5rem;"><a href="/" style="color:var(--muted);font-size:.85rem;text-decoration:none;font-family:var(--mono);border-bottom:1px dashed var(--border);padding-bottom:1px;">&larr; Back to Upload</a></nav>
   <form method="POST" action="/download/login">
+    <input type="hidden" name="returnTo" value="$safeReturnTo">
     <label for="pw">Password</label>
     <input type="password" id="pw" name="password" placeholder="••••••••" autofocus>
     <button type="submit" class="btn">&#128274;&nbsp; Unlock</button>
@@ -1726,7 +2123,9 @@ function Get-LoginPage([bool]$failed = $false) {
 "@
 }
 
-# ── Download Page ────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Download Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-DownloadPage {
     $files = @(Get-UploadableFiles | Sort-Object LastWriteTime -Descending)
 
@@ -2031,6 +2430,7 @@ function Get-DownloadPage {
   </span>
   <nav class="topbar-nav">
     <a href="/">&larr; Upload</a>
+    <a href="/chat">&#128172; Chat</a>
     $(if (-not [string]::IsNullOrEmpty($script:ServerSettings.Password)) { "<a href='/download/logout' class='danger'>&#128274; Lock &amp; Exit</a>" })
   </nav>
 </div>
@@ -2265,9 +2665,193 @@ function copyUrl(btn) {
 "@
 }
 
-# ── Admin Page ───────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Chat Page (protected — same password/session as /download)
+# ────────────────────────────────────────────────────────────────────────
+function Get-ChatPage {
+    return @"
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chat</title>
+<style>$CSS_SHARED
+  .chat-layout { display: grid; grid-template-columns: 320px 1fr; gap: 1.4rem; height: 100%; }
+  @media (max-width: 800px) { .chat-layout { grid-template-columns: 1fr; } }
+  .chat-threads {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    overflow-y: auto; padding: .5rem;
+  }
+  .chat-thread-empty { color: var(--muted); font-family: var(--mono); font-size: .85rem; padding: 1rem; }
+  .chat-thread-row {
+    display: block; width: 100%; text-align: left; padding: .8rem .9rem; margin-bottom: .4rem;
+    background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius);
+    cursor: pointer; color: var(--text); font-family: var(--font);
+  }
+  .chat-thread-row:hover { border-color: var(--accent); }
+  .chat-thread-row.active { border-color: var(--accent2); background: rgba(0,221,255,.08); }
+  .chat-thread-name { font-weight: 700; font-size: .92rem; display: flex; align-items: center; gap: .4rem; }
+  .chat-thread-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); flex-shrink: 0; }
+  .chat-thread-preview { color: var(--muted); font-size: .78rem; font-family: var(--mono); margin-top: .3rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-thread-ip { color: var(--muted); font-size: .7rem; font-family: var(--mono); margin-top: .15rem; opacity: .7; }
+  .chat-conv {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .chat-conv-head { padding: .8rem 1.2rem; border-bottom: 1px solid var(--border); }
+  .chat-conv-head-name { font-weight: 700; }
+  .chat-conv-head-meta { font-family: var(--mono); font-size: .72rem; color: var(--muted); margin-top: .2rem; }
+  .chat-conv-body { flex: 1; overflow-y: auto; padding: 1.2rem; display: flex; flex-direction: column; gap: .7rem; }
+  .chat-conv-empty { color: var(--muted); font-family: var(--mono); font-size: .85rem; margin: auto; }
+  .chat-bubble { max-width: 72%; padding: .6rem .9rem; border-radius: var(--radius); font-size: .9rem; line-height: 1.4; word-wrap: break-word; }
+  .chat-bubble.user { align-self: flex-start; background: var(--surface2); border: 1px solid var(--border); }
+  .chat-bubble.admin { align-self: flex-end; background: var(--accent); color: #0d0d0f; }
+  .chat-bubble-meta { font-size: .68rem; font-family: var(--mono); opacity: .65; margin-top: .3rem; }
+  .chat-conv-input { display: flex; gap: .6rem; padding: 1rem; border-top: 1px solid var(--border); }
+  .chat-conv-input input[type=text] { flex: 1; }
+  .chat-conv-input button { width: auto; margin-top: 0; padding: .75rem 1.4rem; white-space: nowrap; }
+</style></head>
+<body>
+<div class="topbar">
+  <span class="topbar-title">&#128172; Chat <span class="badge">Secure</span></span>
+  <span class="topbar-meta"></span>
+  <nav class="topbar-nav">
+    <a href="/download">Downloads</a>
+    <a href="/">&larr; Upload</a>
+    <a href="/download/logout" class="danger">&#128274; Lock &amp; Exit</a>
+  </nav>
+</div>
+<div class="page">
+  <div class="chat-layout">
+    <div class="chat-threads" id="chatThreads">
+      <div class="chat-thread-empty">Loading&hellip;</div>
+    </div>
+    <div class="chat-conv">
+      <div class="chat-conv-head" id="chatConvHead">
+        <div class="chat-conv-head-name" id="chatConvHeadName">Select a conversation</div>
+        <div class="chat-conv-head-meta" id="chatConvHeadMeta"></div>
+      </div>
+      <div class="chat-conv-body" id="chatConvBody"><div class="chat-conv-empty">No conversation selected.</div></div>
+      <div class="chat-conv-input">
+        <input type="text" id="chatReplyInput" placeholder="Type a reply&hellip;" disabled>
+        <button type="button" class="btn" id="chatReplyBtn" onclick="sendReply()" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+let activeCid = null;
+let lastMsgId = 0;
+
+function fmtTime(ts) {
+  var d = new Date(ts);
+  return d.toLocaleString();
+}
+
+function renderThreads(threads) {
+  var box = document.getElementById('chatThreads');
+  if (!threads.length) { box.innerHTML = '<div class="chat-thread-empty">No messages yet.</div>'; return; }
+  box.innerHTML = threads.map(function(t) {
+    var active = t.cid === activeCid ? ' active' : '';
+    var dot = t.unread ? '<span class="chat-thread-dot"></span>' : '';
+    return '<button type="button" class="chat-thread-row' + active + '" onclick="openThread(\'' + t.cid + '\')">' +
+      '<div class="chat-thread-name">' + dot + escHtml(t.username) + '</div>' +
+      '<div class="chat-thread-preview">' + (t.lastFrom === 'admin' ? 'You: ' : '') + escHtml(t.lastText) + '</div>' +
+      '<div class="chat-thread-ip">' + escHtml(t.ip) + '</div>' +
+      '</button>';
+  }).join('');
+}
+
+function pollThreads() {
+  fetch('/chat/threads').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) renderThreads(d.threads);
+  }).catch(function() {});
+}
+
+function renderMessages(msgs, append) {
+  var body = document.getElementById('chatConvBody');
+  if (!append) body.innerHTML = '';
+  if (!append && !msgs.length) { body.innerHTML = '<div class="chat-conv-empty">No messages yet.</div>'; }
+  msgs.forEach(function(m) {
+    lastMsgId = Math.max(lastMsgId, m.id);
+    var div = document.createElement('div');
+    div.className = 'chat-bubble ' + (m.from === 'admin' ? 'admin' : 'user');
+    div.innerHTML = escHtml(m.text) + '<div class="chat-bubble-meta">' + (m.from === 'admin' ? 'You' : escHtml(m.username)) + ' &middot; ' + fmtTime(m.ts) + '</div>';
+    body.appendChild(div);
+  });
+  if (msgs.length) body.scrollTop = body.scrollHeight;
+}
+
+function openThread(cid) {
+  activeCid = cid;
+  lastMsgId = 0;
+  document.getElementById('chatConvHeadName').textContent = 'Conversation';
+  document.getElementById('chatConvHeadMeta').textContent = 'ID: ' + cid;
+  document.getElementById('chatReplyInput').disabled = false;
+  document.getElementById('chatReplyBtn').disabled = false;
+  fetch('/chat/messages?cid=' + encodeURIComponent(cid) + '&since=0').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      renderMessages(d.messages, false);
+      var userMsg = d.messages.slice().reverse().find(function(m) { return m.from === 'user'; });
+      if (userMsg) {
+        document.getElementById('chatConvHeadName').textContent = userMsg.username;
+        document.getElementById('chatConvHeadMeta').textContent = 'IP: ' + userMsg.ip + '  \u00b7  ID: ' + cid;
+      }
+    }
+  }).catch(function() {});
+  pollThreads();
+}
+
+function pollActiveThread() {
+  if (!activeCid) return;
+  fetch('/chat/messages?cid=' + encodeURIComponent(activeCid) + '&since=' + lastMsgId).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok && d.messages.length) {
+      renderMessages(d.messages, true);
+      var userMsg = d.messages.slice().reverse().find(function(m) { return m.from === 'user'; });
+      if (userMsg) {
+        document.getElementById('chatConvHeadName').textContent = userMsg.username;
+        document.getElementById('chatConvHeadMeta').textContent = 'IP: ' + userMsg.ip + '  \u00b7  ID: ' + activeCid;
+      }
+    }
+  }).catch(function() {});
+}
+
+function sendReply() {
+  var input = document.getElementById('chatReplyInput');
+  var text = input.value.trim();
+  if (!text || !activeCid) return;
+  var btn = document.getElementById('chatReplyBtn');
+  btn.disabled = true;
+  fetch('/chat/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cid: activeCid, message: text })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      input.value = '';
+      renderMessages([d.message], true);
+      pollThreads();
+    }
+  }).catch(function() {}).finally(function() { btn.disabled = false; input.focus(); });
+}
+
+document.getElementById('chatReplyInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); sendReply(); }
+});
+
+pollThreads();
+setInterval(pollThreads, 4000);
+setInterval(pollActiveThread, 3000);
+</script>
+</body></html>
+"@
+}
+
+# ────────────────────────────────────────────────────────────────────────
+# >> Admin Page
+# ────────────────────────────────────────────────────────────────────────
 function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     $regexVal   = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFileRegex)
+    $chatRegexVal = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.ChatUsernameRegex)
     $folderVal  = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.UploadFolder)
     $passwordVal = [System.Net.WebUtility]::HtmlEncode($script:ServerSettings.Password)
     $maxMbVal = if ($script:ServerSettings.MaxUploadSize -gt 0) {
@@ -2275,6 +2859,7 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     } else { "0" }
     $ipWhitelistVal = [System.Net.WebUtility]::HtmlEncode(($script:ServerSettings.UploadIPWhitelist -join ', '))
     $regexStatusBadge    = if ([string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) { "Disabled" } else { "Active" }
+    $chatRegexStatusBadge = if ([string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) { "Disabled" } else { "Active" }
     $passwordStatusBadge = if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) { "Unsecured" } else { "Protected" }
     $folderStatusBadge   = "Configured"
     $maxSizeStatusBadge  = if ($script:ServerSettings.MaxUploadSize -gt 0) { (Format-ByteSize $script:ServerSettings.MaxUploadSize) } else { "Unlimited" }
@@ -2540,6 +3125,29 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
     </div>
 
     <div class="setting-group">
+      <button class="setting-header" type="button" onclick="toggleSetting('set-chatregex')" aria-expanded="true">
+        <span class="setting-icon">&#128172;</span>
+        <span class="setting-title">Chat username regex</span>
+        <span class="setting-status $(if ([string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) { 'warn' })" id="status-chatregex">$chatRegexStatusBadge</span>
+        <span class="setting-chevron" id="chev-set-chatregex">&#9650;</span>
+      </button>
+      <div class="setting-body" id="set-chatregex">
+        <p class="setting-help">
+          When set, chat usernames must match this .NET regex pattern or the message is rejected.
+          Leave empty to allow any username. Example: <code>^[A-Za-z0-9 ]{2,20}$</code>
+          Test patterns on <a href="https://regex101.com/" target="_blank" rel="noopener noreferrer">regex101.com</a>
+          (select the <strong>.NET</strong> flavor).
+        </p>
+        <div class="label-row">
+          <label for="chatUsernameRegex">Pattern</label>
+          <a href="https://regex101.com/" target="_blank" rel="noopener noreferrer" class="regex-help-link"
+             title="Open regex101.com to test .NET patterns">?</a>
+        </div>
+        <input type="text" id="chatUsernameRegex" name="chatUsernameRegex" placeholder="e.g. ^[A-Za-z0-9 ]{2,20}$" value="$chatRegexVal" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+
+    <div class="setting-group">
       <button class="setting-header" type="button" onclick="toggleSetting('set-maxsize')" aria-expanded="true">
         <span class="setting-icon">&#128230;</span>
         <span class="setting-title">Max upload size</span>
@@ -2593,8 +3201,8 @@ function Get-AdminPage([string]$msg = "", [bool]$isError = $false) {
           During the window, a countdown to close is shown. After the end time, uploads are locked and visitors see when uploads concluded.
           Times use this machine's local timezone.
         </p>
-        <input type="checkbox" id="uploadWindowEnabled"$(if ($winEnabled) { ' checked' })>
         <div class="window-enable-row" id="windowEnableRow" onclick="toggleWindowEnabled()">
+          <input type="checkbox" id="uploadWindowEnabled" name="uploadWindowEnabled" style="display:none;" $(if ($winEnabled) { 'checked' }) tabindex="-1" aria-hidden="true">
           <span class="toggle-track" id="toggleTrack"></span>
           <span class="window-enable-label">
             Enable upload time window
@@ -2673,6 +3281,12 @@ function updateStatusBadges(s) {
     var regexOn = !!(s.uploadFileRegex && s.uploadFileRegex.trim());
     regexEl.textContent = regexOn ? 'Active' : 'Disabled';
     regexEl.classList.toggle('warn', !regexOn);
+  }
+  var chatRegexEl = document.getElementById('status-chatregex');
+  if (chatRegexEl) {
+    var chatRegexOn = !!(s.chatUsernameRegex && s.chatUsernameRegex.trim());
+    chatRegexEl.textContent = chatRegexOn ? 'Active' : 'Disabled';
+    chatRegexEl.classList.toggle('warn', !chatRegexOn);
   }
   if (pwEl) {
     var secured = !!(s.password && String(s.password).length);
@@ -2820,6 +3434,7 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
   try {
     const payload = {
       uploadFileRegex: document.getElementById('uploadFileRegex').value,
+      chatUsernameRegex: document.getElementById('chatUsernameRegex').value,
       uploadFolder: document.getElementById('uploadFolder').value,
       password: document.getElementById('downloadPassword').value,
       maxUploadSize: mbToBytes(document.getElementById('maxUploadSizeMb').value),
@@ -2839,6 +3454,7 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
     }
     if (data.settings) {
       document.getElementById('uploadFileRegex').value = data.settings.uploadFileRegex || '';
+      document.getElementById('chatUsernameRegex').value = data.settings.chatUsernameRegex || '';
       document.getElementById('uploadFolder').value = data.settings.uploadFolder || '';
       document.getElementById('downloadPassword').value = data.settings.password || '';
       document.getElementById('maxUploadSizeMb').value = bytesToMbStr(data.settings.maxUploadSize);
@@ -2880,7 +3496,9 @@ document.getElementById('applyBtn').addEventListener('click', async function() {
 "@
 }
 
-# ── Multipart Parser ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Multipart Parser
+# ────────────────────────────────────────────────────────────────────────
 #
 # Performance design
 # ──────────────────
@@ -2941,13 +3559,19 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
     $savedNames   = [System.Collections.Generic.List[string]]::new()
     $bodyCounter  = @{ Value = 0L }
 
-    # ── Pending queue: O(1) Enqueue / Dequeue (replaces List[byte].RemoveAt(0))
+# ────────────────────────────────────────────────────────────────────────
+# >> Pending queue: O(1) Enqueue / Dequeue (replaces List[byte].RemoveAt(0))
+# ────────────────────────────────────────────────────────────────────────
     $pending = [System.Collections.Generic.Queue[byte]]::new(512)
 
-    # ── Wrap the raw InputStream in a BufferedStream for large-block reads ────
+# ────────────────────────────────────────────────────────────────────────
+# >> Wrap the raw InputStream in a BufferedStream for large-block reads
+# ────────────────────────────────────────────────────────────────────────
     $bufferedInput = [System.IO.BufferedStream]::new($req.InputStream, 262144)  # 256 KB buffer
 
-    # ── Single-byte refill buffer (avoids ReadByte() boxing overhead) ─────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Single-byte refill buffer (avoids ReadByte() boxing overhead)
+# ────────────────────────────────────────────────────────────────────────
     [byte[]]$oneByteBuf = New-Object byte[] 1
 
     function Add-BodyBytes([long]$count) {
@@ -3023,7 +3647,9 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
         }
     }
 
-    # ── Boyer-Moore-Horspool bad-character skip table ─────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Boyer-Moore-Horspool bad-character skip table
+# ────────────────────────────────────────────────────────────────────────
     # Typical skip per mismatch ≈ boundary length (~30-70 bytes) vs old O(1) advance.
     [int[]]$bmhSkip = New-Object int[] 256
     $patLen = $delimiterBytes.Length
@@ -3165,8 +3791,17 @@ function Save-UploadedFile([System.Net.HttpListenerRequest]$req, [string]$sender
     return @{ Names = $savedNames; Error = $null }
 }
 
-# ── HTTP Server ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> HTTP Server
+# ────────────────────────────────────────────────────────────────────────
 function Add-ServerFirewallRule {
+    if (-not $script:OnWindows) {
+        # Not attempting to handle every possible Linux/macOS firewall (ufw, firewalld,
+        # nftables, pf, etc.) — just let the person know they may need to open it themselves.
+        Write-ServerLog "Firewall: automatic rule creation is only supported on Windows." -Level Warn
+        Write-ServerLog "If a local firewall is enabled, please allow inbound TCP traffic on port $Port yourself."
+        return
+    }
     try {
         $existing = Get-NetFirewallRule -DisplayName $script:FirewallRuleName -ErrorAction SilentlyContinue
         if ($existing) {
@@ -3177,7 +3812,8 @@ function Add-ServerFirewallRule {
         $script:FirewallRuleCreated = $true
         Write-ServerLog "Firewall: added TCP inbound rule for port $Port" -Level Info
     } catch {
-        Write-ServerLog "Firewall: could not create TCP port rule — $($_.Exception.Message)" -Level Warn
+        Write-ServerLog "Firewall: could not create TCP port rule automatically — $($_.Exception.Message)" -Level Warn
+        Write-ServerLog "Please allow inbound TCP traffic on port $Port yourself via Windows Defender Firewall."
     }
 }
 
@@ -3227,8 +3863,8 @@ try {
     exit 1
 }
 
-$privateIP = (Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -ne "Disconnected"}).IPv4Address.IPAddress
-$script:ServerSettings.PrivateIP = if ($privateIP -is [array]) { $privateIP[0] } else { [string]$privateIP }
+$privateIP = Get-LocalIPv4Addresses
+$script:ServerSettings.PrivateIP = if ($privateIP.Count -gt 0) { $privateIP[0] } else { "" }
 $publicIP = "No Internet"
 try {
   $publicIP  = (Invoke-WebRequest ifconfig.me/ip -UseBasicParsing).Content.Trim()
@@ -3238,7 +3874,9 @@ try {
 
 
 
-# ── Check whether port is reachable from the internet ────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> Check whether port is reachable from the internet
+# ────────────────────────────────────────────────────────────────────────
 $portOpen = $false
 try {
     $probe    = Invoke-WebRequest "https://portchecker.io/api/me/${port}" -UseBasicParsing -TimeoutSec 10
@@ -3260,6 +3898,9 @@ Write-Host "  Upload Folder : $($script:ServerSettings.UploadFolder)" -Foregroun
 Write-Host "  Admin Page    : http://127.0.0.1:$Port/admin  (localhost only)" -ForegroundColor DarkCyan
 if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.UploadFileRegex)) {
   Write-Host "  Upload Regex  : $($script:ServerSettings.UploadFileRegex)" -ForegroundColor DarkCyan
+}
+if (-not [string]::IsNullOrWhiteSpace($script:ServerSettings.ChatUsernameRegex)) {
+  Write-Host "  Chat Name Regex: $($script:ServerSettings.ChatUsernameRegex)" -ForegroundColor DarkCyan
 }
 if ($script:ServerSettings.MaxUploadSize -gt 0) {
   Write-Host "  Max Upload    : $(Format-ByteSize $script:ServerSettings.MaxUploadSize)" -ForegroundColor DarkCyan
@@ -3322,7 +3963,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
 
 
     try {
-        # ── GET / ────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /
+# ────────────────────────────────────────────────────────────────────────
         if ($path -eq "" -or $path -eq "/") {
             $ok = $req.QueryString["ok"]
             $err = $req.QueryString["err"]
@@ -3337,7 +3980,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             Send-Response $ctx (Get-UploadPage -msg $msg -isError $isErr -ipBlocked $blocked -clientIP $visitorIP)
         }
 
-        # ── POST /upload ─────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /upload
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/upload" -and $method -eq "POST") {
             $uploaderIP = $req.RemoteEndPoint.Address.ToString()
             Write-ServerLog "POST /upload (form) from $uploaderIP" -Level Info
@@ -3364,7 +4009,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /upload-chunk (single file per XHR, used by progress uploader)
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /upload-chunk (single file per XHR, used by progress uploader)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/upload-chunk" -and $method -eq "POST") {
             $uploaderIP = $req.RemoteEndPoint.Address.ToString()
             Write-ServerLog "POST /upload-chunk from $uploaderIP" -Level Info
@@ -3399,7 +4046,136 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /admin (localhost only) ──────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /chat/send  (public — visitors on the upload page)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/send" -and $method -eq "POST") {
+            $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+            $body   = $reader.ReadToEnd()
+            $data   = $null
+            try { $data = ConvertFrom-Json $body -ErrorAction Stop } catch { $data = $null }
+            $cid  = if ($data) { [string]$data.cid } else { "" }
+            $name = if ($data) { [string]$data.username } else { "" }
+            $text = if ($data) { [string]$data.message } else { "" }
+
+            if (-not (Test-ChatCid $cid)) { $cid = (New-SessionToken) -replace '[^A-Za-z0-9\-]', '' }
+            $name = $name.Trim()
+            if ($name.Length -eq 0) { $name = "Anonymous" }
+            if ($name.Length -gt 40) { $name = $name.Substring(0, 40) }
+            $text = $text.Trim()
+            if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) }
+
+            $nameCheck = Test-ChatUsername $name
+            if (-not $nameCheck.Ok) {
+                $payload = (@{ ok = $false; error = $nameCheck.Message } | ConvertTo-Json -Compress -Depth 2)
+                Send-Response $ctx $payload -status 400 -contentType "application/json; charset=utf-8"
+            } elseif ($text.Length -eq 0) {
+                Send-Response $ctx '{"ok":false,"error":"Message is empty."}' -status 400 -contentType "application/json; charset=utf-8"
+            } else {
+                $ip  = $req.RemoteEndPoint.Address.ToString()
+                $msg = Add-ChatMessage -cid $cid -from 'user' -username $name -text $text -ip $ip
+                Write-ServerLog "Chat message from $ip (cid=$cid, user='$name')" -Level Info
+                $payload = (@{ ok = $true; cid = $cid; message = $msg } | ConvertTo-Json -Compress -Depth 4)
+                Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat/poll?cid=...&since=...  (public — visitors poll for replies)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/poll" -and $method -eq "GET") {
+            $cid   = $req.QueryString["cid"]
+            $since = 0L
+            [void][int64]::TryParse($req.QueryString["since"], [ref]$since)
+            if (-not (Test-ChatCid $cid)) {
+                Send-Response $ctx '{"ok":true,"messages":[]}' -contentType "application/json; charset=utf-8"
+            } else {
+                $msgs = @(Get-ChatMessagesForCid -cid $cid -sinceId $since)
+                $payload = (@{ ok = $true; messages = $msgs } | ConvertTo-Json -Compress -Depth 4)
+                Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat  (protected — same password/session as /download)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat" -and $method -eq "GET") {
+            $token = Get-CookieToken $req
+            if ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token)) {
+                Send-Response $ctx (Get-ChatPage)
+            } else {
+                Send-Response $ctx (Get-LoginPage -returnTo "/chat")
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat/threads  (protected — sidebar list, JSON, for polling)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/threads" -and $method -eq "GET") {
+            $token = Get-CookieToken $req
+            if (-not ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token))) {
+                Send-Response $ctx '{"ok":false,"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $threads = @(Get-ChatThreadsSummary)
+                $payload = (@{ ok = $true; threads = $threads } | ConvertTo-Json -Compress -Depth 4)
+                Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /chat/messages?cid=...&since=...  (protected — one thread's messages)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/messages" -and $method -eq "GET") {
+            $token = Get-CookieToken $req
+            if (-not ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token))) {
+                Send-Response $ctx '{"ok":false,"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $cid   = $req.QueryString["cid"]
+                $since = 0L
+                [void][int64]::TryParse($req.QueryString["since"], [ref]$since)
+                if (-not (Test-ChatCid $cid)) {
+                    Send-Response $ctx '{"ok":false,"error":"Unknown thread."}' -status 400 -contentType "application/json; charset=utf-8"
+                } else {
+                    $msgs = @(Get-ChatMessagesForCid -cid $cid -sinceId $since)
+                    $payload = (@{ ok = $true; messages = $msgs } | ConvertTo-Json -Compress -Depth 4)
+                    Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+                }
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /chat/reply  (protected — admin replies to a thread)
+# ────────────────────────────────────────────────────────────────────────
+        elseif ($path -eq "/chat/reply" -and $method -eq "POST") {
+            $token = Get-CookieToken $req
+            if (-not ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token))) {
+                Send-Response $ctx '{"ok":false,"error":"Unauthorized"}' -status 401 -contentType "application/json; charset=utf-8"
+            } else {
+                $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+                $body   = $reader.ReadToEnd()
+                $data   = $null
+                try { $data = ConvertFrom-Json $body -ErrorAction Stop } catch { $data = $null }
+                $cid  = if ($data) { [string]$data.cid } else { "" }
+                $text = if ($data) { [string]$data.message } else { "" }
+                $text = $text.Trim()
+                if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) }
+                if (-not (Test-ChatCid $cid)) {
+                    Send-Response $ctx '{"ok":false,"error":"Unknown thread."}' -status 400 -contentType "application/json; charset=utf-8"
+                } elseif ($text.Length -eq 0) {
+                    Send-Response $ctx '{"ok":false,"error":"Message is empty."}' -status 400 -contentType "application/json; charset=utf-8"
+                } else {
+                    $ip  = $req.RemoteEndPoint.Address.ToString()
+                    $msg = Add-ChatMessage -cid $cid -from 'admin' -username 'Admin' -text $text -ip $ip
+                    Write-ServerLog "Chat reply sent to cid=$cid" -Level Info
+                    $payload = (@{ ok = $true; message = $msg } | ConvertTo-Json -Compress -Depth 4)
+                    Send-Response $ctx $payload -contentType "application/json; charset=utf-8"
+                }
+            }
+        }
+
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /admin (localhost only)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin") {
             if (-not (Test-IsLocalRequest $req)) {
                 Write-ServerLog "GET /admin denied — not localhost ($($req.RemoteEndPoint.Address))" -Level Warn
@@ -3410,7 +4186,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /admin/settings (localhost only) ─────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /admin/settings (localhost only)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin/settings" -and $method -eq "GET") {
             if (-not (Test-IsLocalRequest $req)) {
                 Send-Response $ctx '{"ok":false,"error":"Forbidden"}' -status 403 -contentType "application/json; charset=utf-8"
@@ -3419,7 +4197,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /admin/settings (localhost only) ────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /admin/settings (localhost only)
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/admin/settings" -and $method -eq "POST") {
             if (-not (Test-IsLocalRequest $req)) {
                 Send-Response $ctx '{"ok":false,"error":"Forbidden"}' -status 403 -contentType "application/json; charset=utf-8"
@@ -3438,6 +4218,7 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
                         maxUploadSize       = $s.maxUploadSize
                         uploadIPWhitelist   = $s.uploadIPWhitelist
                         uploadWindowEnabled = $s.uploadWindowEnabled
+                        chatUsernameRegex   = $s.chatUsernameRegex
                     } | ConvertTo-Json -Compress -Depth 2)
                     $innerJson = $innerJson.TrimEnd('}') + ',' +
                         '"uploadWindowStart":' + $winStartJson + ',' +
@@ -3451,7 +4232,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download ────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download") {
             $token = Get-CookieToken $req
             if ([string]::IsNullOrEmpty($script:ServerSettings.Password) -or (Test-Session $token)) {
@@ -3461,30 +4244,35 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── POST /download/login ─────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> POST /download/login
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/login" -and $method -eq "POST") {
+            $reader     = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+            $body       = $reader.ReadToEnd()
+            $parsed     = [System.Web.HttpUtility]::ParseQueryString($body)
+            $returnTo   = if ($parsed["returnTo"] -eq "/chat") { "/chat" } else { "/download" }
             if ([string]::IsNullOrEmpty($script:ServerSettings.Password)) {
-                Send-Redirect $ctx "/download"
+                Send-Redirect $ctx $returnTo
             } else {
-                $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
-                $body   = $reader.ReadToEnd()
-                $parsed = [System.Web.HttpUtility]::ParseQueryString($body)
-                $pw     = $parsed["password"]
+                $pw = $parsed["password"]
                 if ($pw -eq $script:ServerSettings.Password) {
                     $token = New-SessionToken
                     $expiry = (Get-Date).AddHours(4)
                     $Sessions[$token] = $expiry
                     Write-ServerLog "Download login OK from $($req.RemoteEndPoint.Address) (session until $($expiry.ToString('HH:mm:ss')))" -Level Ok
                     $ctx.Response.AppendHeader("Set-Cookie", "ds=$token; $(Get-SessionCookieAttributes $req)")
-                    Send-Redirect $ctx "/download"
+                    Send-Redirect $ctx $returnTo
                 } else {
                     Write-ServerLog "Download login failed from $($req.RemoteEndPoint.Address)" -Level Warn
-                    Send-Response $ctx (Get-LoginPage -failed $true)
+                    Send-Response $ctx (Get-LoginPage -failed $true -returnTo $returnTo)
                 }
             }
         }
 
-        # ── GET /download/logout ─────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/logout
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/logout") {
             $token = Get-CookieToken $req
             if ($token) {
@@ -3495,7 +4283,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             Send-Redirect $ctx "/download"
         }
 
-        # ── GET /download/file?name=... ──────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/file?name=...
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/file") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3516,7 +4306,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip-all ────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/zip-all
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/zip-all") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3534,7 +4326,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip?ip=...  OR  /download/zip?filename=... ────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/zip?ip=...  OR  /download/zip?filename=...
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/zip") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3566,7 +4360,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── GET /download/zip-mega?mode=ip|filename ──────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> GET /download/zip-mega?mode=ip|filename
+# ────────────────────────────────────────────────────────────────────────
         elseif ($path -eq "/download/zip-mega") {
             $token     = Get-CookieToken $req
             $quickpass = $req.QueryString["password"]
@@ -3586,7 +4382,9 @@ function Handle-HttpContext([System.Net.HttpListenerContext]$ctx) {
             }
         }
 
-        # ── 404 ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# >> 404
+# ────────────────────────────────────────────────────────────────────────
         else {
             Write-ServerLog "404 Not Found: $method $path" -Level Warn
             Send-Response $ctx "<h2 style='font-family:sans-serif;color:#888'>404 — Not Found</h2>" -status 404
@@ -3654,6 +4452,15 @@ function New-RequestRunspacePool {
         'Save-UploadedFile',
         'Send-Response',
         'Send-Redirect',
+        'Get-ChatDataDir',
+        'Get-ChatDataFile',
+        'Save-ChatStoreToDisk',
+        'Test-ChatCid',
+        'Test-ChatUsername',
+        'Add-ChatMessage',
+        'Get-ChatMessagesForCid',
+        'Get-ChatThreadsSummary',
+        'Get-ChatPage',
         'Handle-HttpContext'
     )
     foreach ($name in $functionNames) {
@@ -3666,6 +4473,8 @@ function New-RequestRunspacePool {
     $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('AllSendersZipCache', $script:AllSendersZipCache, 'Shared all-senders zip cache'))
     $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('AllSendersZipLock', $script:AllSendersZipLock, 'Shared all-senders zip cache lock'))
     $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CSS_SHARED', $CSS_SHARED, 'Shared CSS template'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ChatMessages', $script:ChatMessages, 'Shared chat message store'))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ChatLock', $script:ChatLock, 'Shared chat message store lock'))
     $maxRunspaces = [Math]::Max(4, [Environment]::ProcessorCount * 4)
     $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $maxRunspaces, $iss, $Host)
     $pool.Open()
@@ -3693,6 +4502,7 @@ function Clear-CompletedRequestWorkers {
     }
 }
 
+Initialize-ChatStore
 $script:RequestRunspacePool = New-RequestRunspacePool
 $script:ActiveRequestWorkers = [System.Collections.Generic.List[object]]::new()
 

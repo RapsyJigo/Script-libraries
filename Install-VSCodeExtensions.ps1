@@ -57,9 +57,9 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR')]$Level = 'INFO')
     $ts    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -221,9 +221,9 @@ function Update-ExtensionsJson {
     $merged | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8 -Force
 }
 
-# ---------------------------------------------------------------------------
-# Step 1 – Parse and validate extension IDs
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Parse and validate extension list
+# ─────────────────────────────────────────────────────────────────────────────
 Write-Log "Parsing extension list."
 
 $ExtensionIdPattern = '^[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$'
@@ -239,16 +239,16 @@ $extensionIds = $ExtensionsCsv -split '[,\r\n]+' |
     } |
     Sort-Object -Unique
 
-if ($extensionIds.Count -eq 0) {
+if (@($extensionIds).Count -eq 0) {
     Write-Log "No valid extension IDs found in input. Exiting." -Level WARN
     exit 0
 }
 
-Write-Log "Found $($extensionIds.Count) extension(s) to deploy."
+Write-Log "Found $(@($extensionIds).Count) extension(s) to deploy."
 
-# ---------------------------------------------------------------------------
-# Step 2 – Resolve VS Code install path (for bootstrap folder)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Validate install path
+# ─────────────────────────────────────────────────────────────────────────────
 if (-not $VsCodeInstallPath) {
     $candidates = @(
         "$env:ProgramFiles\Microsoft VS Code",
@@ -263,19 +263,19 @@ if ($VsCodeInstallPath) {
     Write-Log "VS Code installation not found — bootstrap folder will be skipped." -Level WARN
 }
 
-# ---------------------------------------------------------------------------
-# Step 3 – Collect real user profiles
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Get real users
+# ─────────────────────────────────────────────────────────────────────────────
 $skipNames = @('Public', 'Default', 'Default User', 'All Users', 'defaultuser0')
 
 $userProfiles = Get-ChildItem -Path $UserProfilesRoot -Directory -ErrorAction SilentlyContinue |
     Where-Object { $skipNames -notcontains $_.Name }
 
-Write-Log "Found $($userProfiles.Count) user profile(s): $($userProfiles.Name -join ', ')"
+Write-Log "Found $(@($userProfiles).Count) user profile(s): $($userProfiles.Name -join ', ')"
 
-# ---------------------------------------------------------------------------
-# Step 4 – Fetch marketplace metadata for all extensions
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Get marketplace metadata
+# ─────────────────────────────────────────────────────────────────────────────
 Write-Log "Fetching marketplace metadata..."
 
 $allMeta = [ordered]@{}   # extensionId (lower) -> hashtable
@@ -290,14 +290,14 @@ foreach ($id in $extensionIds) {
     }
 }
 
-if ($allMeta.Count -eq 0) {
+if (@($allMeta).Count -eq 0) {
     Write-Log "No metadata could be fetched. Exiting." -Level ERROR
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# Step 5 – Download .vsix files to a shared staging directory
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Get vsix files
+# ─────────────────────────────────────────────────────────────────────────────
 $stagingDir = Join-Path $env:TEMP 'VSCodeExtensionDeploy'
 if (-not (Test-Path $stagingDir)) {
     New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
@@ -331,14 +331,14 @@ foreach ($id in $allMeta.Keys) {
     }
 }
 
-if ($vsixFiles.Count -eq 0) {
+if (@($vsixFiles).Count -eq 0) {
     Write-Log "No extensions downloaded successfully. Exiting." -Level ERROR
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# Step 6 – Deploy to each existing user profile
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Deploy to all user profiles
+# ─────────────────────────────────────────────────────────────────────────────
 foreach ($current_profile in $userProfiles) {
     $extensionsDir = Join-Path $current_profile.FullName '.vscode\extensions'
     Write-Log "Processing user: $($current_profile.Name)"
@@ -373,7 +373,7 @@ foreach ($current_profile in $userProfiles) {
     }
 
     # --- Update extensions.json ---
-    if ($newEntries.Count -gt 0) {
+    if (@($newEntries).Count -gt 0) {
         if ($PSCmdlet.ShouldProcess((Join-Path $extensionsDir 'extensions.json'), "Update extensions.json for $($current_profile.Name)")) {
             try {
                 Update-ExtensionsJson -ExtensionsDir $extensionsDir -NewEntries $newEntries
@@ -385,9 +385,9 @@ foreach ($current_profile in $userProfiles) {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Step 7 – Populate bootstrap folder for future new users
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# >> Add to bootrap for future users
+# ─────────────────────────────────────────────────────────────────────────────
 if ($VsCodeInstallPath) {
     $bootstrapDir = Join-Path $VsCodeInstallPath 'bootstrap\extensions'
 
@@ -411,7 +411,4 @@ if ($VsCodeInstallPath) {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Step 8 – Summary
-# ---------------------------------------------------------------------------
-Write-Log "Done. Processed $($vsixFiles.Count) extension(s) across $($userProfiles.Count) user profile(s)."
+Write-Log "Done. Processed $(@($vsixFiles).Count) extension(s) across $(@($userProfiles).Count) user profile(s)."
